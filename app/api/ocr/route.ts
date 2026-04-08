@@ -45,6 +45,7 @@ export async function POST(request: NextRequest) {
             {
               type: "input_image",
               image_url: `data:${file.type};base64,${base64}`,
+              detail: "auto",
             },
           ],
         },

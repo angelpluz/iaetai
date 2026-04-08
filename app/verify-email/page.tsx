@@ -9,7 +9,7 @@ type VerifyStatus = "loading" | "success" | "error";
 export default function VerifyEmailPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const token = searchParams.get("token");
+  const token = searchParams.get("token") ?? "";
 
   const [status, setStatus] = useState<VerifyStatus>(token ? "loading" : "error");
   const [message, setMessage] = useState(token ? "" : "ไม่พบ token สำหรับยืนยันอีเมล");
