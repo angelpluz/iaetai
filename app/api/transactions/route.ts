@@ -23,10 +23,28 @@ export async function GET(request: NextRequest) {
   if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const { searchParams } = new URL(request.url);
-  const qs = new URLSearchParams({
-    limit: searchParams.get("limit") ?? "100",
-    offset: searchParams.get("offset") ?? "0",
-  });
+  const qs = new URLSearchParams();
+  const passthroughKeys = [
+    "limit",
+    "offset",
+    "mode",
+    "day",
+    "month",
+    "year",
+    "from",
+    "to",
+    "type",
+    "category",
+    "shape",
+  ];
+
+  for (const key of passthroughKeys) {
+    const value = searchParams.get(key);
+    if (value !== null && value !== "") qs.set(key, value);
+  }
+
+  if (!qs.get("limit")) qs.set("limit", "100");
+  if (!qs.get("offset")) qs.set("offset", "0");
 
   const res = await fetch(`${GW}/api/v1/transactions?${qs}`, {
     headers: { Authorization: `Bearer ${token}` },

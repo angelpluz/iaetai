@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type Language = "th" | "en";
 const FIXED_CATEGORY_KEYS = ["food", "transport", "shopping", "bill", "transfer", "other"] as const;
@@ -28,6 +28,20 @@ interface BudgetCaps {
   incomeCap: number;
   categories: Record<string, number>;
   customCategories: string[];
+}
+
+type FilterMode = "all" | "day" | "month" | "year" | "range";
+type FilterType = "all" | "expense" | "income";
+
+interface DashboardFilter {
+  mode: FilterMode;
+  day: string;
+  month: string;
+  year: string;
+  from: string;
+  to: string;
+  type: FilterType;
+  category: string;
 }
 
 const CAPS_STORAGE_KEY = "iaet:budget-caps:v1";
@@ -164,6 +178,36 @@ function formatCurrency(value: number) {
   return `THB ${value.toLocaleString("th-TH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function todayDateString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function monthStringFromDate(value: string) {
+  return value ? value.slice(0, 7) : "";
+}
+
+function yearStringFromDate(value: string) {
+  return value ? value.slice(0, 4) : "";
+}
+
+function buildFilterQuery(filter: DashboardFilter): string {
+  const qs = new URLSearchParams();
+  qs.set("mode", filter.mode);
+
+  if (filter.mode === "day" && filter.day) qs.set("day", filter.day);
+  if (filter.mode === "month" && filter.month) qs.set("month", filter.month);
+  if (filter.mode === "year" && filter.year) qs.set("year", filter.year);
+  if (filter.mode === "range") {
+    if (filter.from) qs.set("from", filter.from);
+    if (filter.to) qs.set("to", filter.to);
+  }
+
+  if (filter.type !== "all") qs.set("type", filter.type);
+  if (filter.category && filter.category !== "all") qs.set("category", filter.category);
+
+  return qs.toString();
+}
+
 function readCapsFromStorage(): BudgetCaps {
   if (typeof window === "undefined") return DEFAULT_CAPS;
 
@@ -290,20 +334,45 @@ export default function DashboardPage() {
   const [lang, setLang] = useState<Language>(() => readLanguageFromStorage());
   const [caps, setCaps] = useState<BudgetCaps>(() => readCapsFromStorage());
   const [newCategoryInput, setNewCategoryInput] = useState("");
+  const [filter, setFilter] = useState<DashboardFilter>(() => {
+    const today = todayDateString();
+    return {
+      mode: "day",
+      day: today,
+      month: monthStringFromDate(today),
+      year: yearStringFromDate(today),
+      from: today,
+      to: today,
+      type: "all",
+      category: "all",
+    };
+  });
 
   const t = COPY[lang];
 
-  useEffect(() => {
-    Promise.all([fetch("/api/summary"), fetch("/api/transactions")])
-      .then(async ([summaryResponse, transactionsResponse]) => {
-        const summaryData = normalizeSummaryResponse(await summaryResponse.json());
-        const transactionsData = normalizeTransactionsResponse(await transactionsResponse.json());
+  const fetchDashboardData = useCallback(async () => {
+    setLoading(true);
+    const query = buildFilterQuery(filter);
+    const suffix = query ? `?${query}` : "";
 
-        setSummary(summaryData);
-        setTransactions(transactionsData);
-      })
-      .finally(() => setLoading(false));
-  }, []);
+    try {
+      const [summaryResponse, transactionsResponse] = await Promise.all([
+        fetch(`/api/summary${suffix}`),
+        fetch(`/api/transactions${suffix}`),
+      ]);
+      const summaryData = normalizeSummaryResponse(await summaryResponse.json());
+      const transactionsData = normalizeTransactionsResponse(await transactionsResponse.json());
+
+      setSummary(summaryData);
+      setTransactions(transactionsData);
+    } finally {
+      setLoading(false);
+    }
+  }, [filter]);
+
+  useEffect(() => {
+    fetchDashboardData();
+  }, [fetchDashboardData]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -314,6 +383,28 @@ export default function DashboardPage() {
     if (typeof window === "undefined") return;
     window.localStorage.setItem(LANG_STORAGE_KEY, lang);
   }, [lang]);
+
+  const categoryFilterOptions = useMemo(() => {
+    const values = new Set<string>(["all"]);
+    for (const key of FIXED_CATEGORY_KEYS) values.add(key);
+    for (const tx of transactions) {
+      const key = String(tx.category || "other").toLowerCase();
+      if (key) values.add(key);
+    }
+    return Array.from(values);
+  }, [transactions]);
+
+  const periodLabel = useMemo(() => {
+    if (filter.mode === "day" && filter.day) return filter.day;
+    if (filter.mode === "month" && filter.month) return filter.month;
+    if (filter.mode === "year" && filter.year) return filter.year;
+    if (filter.mode === "range") {
+      if (filter.from && filter.to) return `${filter.from} - ${filter.to}`;
+      if (filter.from) return `${filter.from} - ...`;
+      if (filter.to) return `... - ${filter.to}`;
+    }
+    return lang === "th" ? "ทั้งหมด" : "All time";
+  }, [filter, lang]);
 
   const computed = useMemo(() => {
     const expenseByCategory: Record<string, number> = {};
@@ -472,6 +563,166 @@ export default function DashboardPage() {
               >
                 {t.backToChat}
               </Link>
+            </div>
+          </div>
+        </section>
+
+        <section className="app-card rounded-[26px] border px-4 py-4 sm:px-5">
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm font-semibold text-slate-900">
+                {lang === "th" ? "ตัวกรองช่วงเวลาและเงื่อนไข" : "Date and condition filters"}
+              </p>
+              <p className="text-xs text-slate-500">
+                {lang === "th" ? `ช่วงที่กำลังดู: ${periodLabel}` : `Viewing: ${periodLabel}`}
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <label className="space-y-1">
+                <span className="text-xs font-medium text-slate-500">{lang === "th" ? "โหมดเวลา" : "Mode"}</span>
+                <select
+                  value={filter.mode}
+                  onChange={(event) =>
+                    setFilter((prev) => ({
+                      ...prev,
+                      mode: event.target.value as FilterMode,
+                    }))
+                  }
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                >
+                  <option value="all">{lang === "th" ? "ทั้งหมด" : "All time"}</option>
+                  <option value="day">{lang === "th" ? "รายวัน" : "Day"}</option>
+                  <option value="month">{lang === "th" ? "รายเดือน" : "Month"}</option>
+                  <option value="year">{lang === "th" ? "รายปี" : "Year"}</option>
+                  <option value="range">{lang === "th" ? "ช่วงวันที่" : "Date range"}</option>
+                </select>
+              </label>
+
+              {filter.mode === "day" ? (
+                <label className="space-y-1">
+                  <span className="text-xs font-medium text-slate-500">{lang === "th" ? "วันที่" : "Day"}</span>
+                  <input
+                    type="date"
+                    value={filter.day}
+                    onChange={(event) =>
+                      setFilter((prev) => ({
+                        ...prev,
+                        day: event.target.value,
+                        month: monthStringFromDate(event.target.value),
+                        year: yearStringFromDate(event.target.value),
+                        from: event.target.value || prev.from,
+                        to: event.target.value || prev.to,
+                      }))
+                    }
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                </label>
+              ) : null}
+
+              {filter.mode === "month" ? (
+                <label className="space-y-1">
+                  <span className="text-xs font-medium text-slate-500">{lang === "th" ? "เดือน" : "Month"}</span>
+                  <input
+                    type="month"
+                    value={filter.month}
+                    onChange={(event) =>
+                      setFilter((prev) => ({
+                        ...prev,
+                        month: event.target.value,
+                        year: event.target.value ? event.target.value.slice(0, 4) : prev.year,
+                      }))
+                    }
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                </label>
+              ) : null}
+
+              {filter.mode === "year" ? (
+                <label className="space-y-1">
+                  <span className="text-xs font-medium text-slate-500">{lang === "th" ? "ปี" : "Year"}</span>
+                  <input
+                    type="number"
+                    min={2000}
+                    max={2100}
+                    value={filter.year}
+                    onChange={(event) => setFilter((prev) => ({ ...prev, year: event.target.value }))}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                </label>
+              ) : null}
+
+              {filter.mode === "range" ? (
+                <>
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium text-slate-500">{lang === "th" ? "จากวันที่" : "From"}</span>
+                    <input
+                      type="date"
+                      value={filter.from}
+                      onChange={(event) => setFilter((prev) => ({ ...prev, from: event.target.value }))}
+                      className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium text-slate-500">{lang === "th" ? "ถึงวันที่" : "To"}</span>
+                    <input
+                      type="date"
+                      value={filter.to}
+                      onChange={(event) => setFilter((prev) => ({ ...prev, to: event.target.value }))}
+                      className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                    />
+                  </label>
+                </>
+              ) : null}
+
+              <label className="space-y-1">
+                <span className="text-xs font-medium text-slate-500">{lang === "th" ? "ประเภทรายการ" : "Type"}</span>
+                <select
+                  value={filter.type}
+                  onChange={(event) => setFilter((prev) => ({ ...prev, type: event.target.value as FilterType }))}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                >
+                  <option value="all">{lang === "th" ? "ทั้งหมด" : "All"}</option>
+                  <option value="expense">{lang === "th" ? "รายจ่าย" : "Expense"}</option>
+                  <option value="income">{lang === "th" ? "รายรับ" : "Income"}</option>
+                </select>
+              </label>
+
+              <label className="space-y-1">
+                <span className="text-xs font-medium text-slate-500">{lang === "th" ? "หมวด" : "Category"}</span>
+                <select
+                  value={filter.category}
+                  onChange={(event) => setFilter((prev) => ({ ...prev, category: event.target.value }))}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                >
+                  {categoryFilterOptions.map((key) => (
+                    <option key={key} value={key}>
+                      {key === "all" ? (lang === "th" ? "ทุกหมวด" : "All categories") : getCategoryLabel(key, lang)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="flex items-end">
+                <button
+                  onClick={() => {
+                    const today = todayDateString();
+                    setFilter({
+                      mode: "day",
+                      day: today,
+                      month: monthStringFromDate(today),
+                      year: yearStringFromDate(today),
+                      from: today,
+                      to: today,
+                      type: "all",
+                      category: "all",
+                    });
+                  }}
+                  className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-200"
+                >
+                  {lang === "th" ? "รีเซ็ตตัวกรอง" : "Reset filters"}
+                </button>
+              </div>
             </div>
           </div>
         </section>

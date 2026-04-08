@@ -63,6 +63,41 @@ interface TextExtractionResult {
   reference: string | null;
 }
 
+type SummaryMode = "all" | "day" | "month" | "year" | "range";
+
+interface SummaryFilter {
+  mode: SummaryMode;
+  day?: string;
+  month?: string;
+  year?: string;
+  from?: string;
+  to?: string;
+  type?: "expense" | "income";
+  category?: string;
+}
+
+interface SummaryIntent {
+  shouldSummarize: boolean;
+  filter: SummaryFilter;
+}
+
+interface GatewaySummaryData {
+  totalExpense: number;
+  totalIncome: number;
+  balance: number;
+  categories: Array<{ category: string; total: number }>;
+}
+
+interface GatewayTransactionRow {
+  id: string;
+  item: string;
+  amount: number;
+  type: "expense" | "income";
+  category: string;
+  merchant: string;
+  datetime: string;
+}
+
 const AI_PARSE_PROMPT = `Extract financial transaction data from OCR text. Fix OCR errors (O→0, l→1, "10o.00"→100.00).
 Return ONLY valid JSON, no extra text:
 {
@@ -124,6 +159,485 @@ Rules:
 - shouldSave=false for questions, plans, reminders, or unclear amounts.
 - amount must be number (no currency symbols). If unknown use null.
 - type must be "expense" or "income".`;
+
+const THAI_MONTH_ALIASES: Array<{ month: number; aliases: string[] }> = [
+  { month: 1, aliases: ["มกราคม", "มกรา", "ม.ค.", "มค", "jan", "january"] },
+  { month: 2, aliases: ["กุมภาพันธ์", "กุมภา", "ก.พ.", "กพ", "feb", "february"] },
+  { month: 3, aliases: ["มีนาคม", "มีนา", "มี.ค.", "มีค", "mar", "march"] },
+  { month: 4, aliases: ["เมษายน", "เมษา", "เม.ย.", "เมย", "เมษ", "apr", "april"] },
+  { month: 5, aliases: ["พฤษภาคม", "พฤษภา", "พ.ค.", "พค", "may"] },
+  { month: 6, aliases: ["มิถุนายน", "มิถุนา", "มิ.ย.", "มิย", "jun", "june"] },
+  { month: 7, aliases: ["กรกฎาคม", "กรกฎา", "ก.ค.", "กค", "jul", "july"] },
+  { month: 8, aliases: ["สิงหาคม", "สิงหา", "ส.ค.", "สค", "aug", "august"] },
+  { month: 9, aliases: ["กันยายน", "กันยา", "ก.ย.", "กย", "sep", "september"] },
+  { month: 10, aliases: ["ตุลาคม", "ตุลา", "ต.ค.", "ตค", "oct", "october"] },
+  { month: 11, aliases: ["พฤศจิกายน", "พฤศจิกา", "พ.ย.", "พย", "nov", "november"] },
+  { month: 12, aliases: ["ธันวาคม", "ธันวา", "ธ.ค.", "ธค", "dec", "december"] },
+];
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function toBangkokDateLiteral(date: Date): string {
+  const bangkokMs = date.getTime() + 7 * 60 * 60 * 1000;
+  const shifted = new Date(bangkokMs);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function currentBangkokYear(now: Date): number {
+  return Number(toBangkokDateLiteral(now).slice(0, 4));
+}
+
+function normalizeCalendarYear(raw: string, fallbackYear: number): number {
+  const numeric = Number(raw);
+  if (!Number.isFinite(numeric)) return fallbackYear;
+
+  let year = numeric;
+  if (year > 2400) year -= 543;
+  if (year < 100) year += 2000;
+  if (year < 1900 || year > 2200) return fallbackYear;
+  return year;
+}
+
+function toDateLiteral(year: number, month: number, day: number): string | null {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() + 1 !== month ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  const yyyy = String(year).padStart(4, "0");
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseSlashDateLiteral(raw: string, fallbackYear: number): string | null {
+  const parts = raw.split("/").map((part) => part.trim());
+  if (parts.length < 2 || parts.length > 3) return null;
+
+  const day = Number(parts[0]);
+  const month = Number(parts[1]);
+  const year = parts.length === 3 ? normalizeCalendarYear(parts[2], fallbackYear) : fallbackYear;
+  return toDateLiteral(year, month, day);
+}
+
+function parseIsoDateLiteral(raw: string): string | null {
+  const match = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!match) return null;
+  return toDateLiteral(Number(match[1]), Number(match[2]), Number(match[3]));
+}
+
+function parseThaiMonthDateLiteral(text: string, fallbackYear: number): string | null {
+  const lowered = text.toLowerCase();
+
+  for (const monthInfo of THAI_MONTH_ALIASES) {
+    for (const alias of monthInfo.aliases) {
+      const pattern = new RegExp(`(?:วันที่\\s*)?(\\d{1,2})\\s*${escapeRegExp(alias)}(?:\\s*(\\d{2,4}))?`, "i");
+      const match = lowered.match(pattern);
+      if (!match) continue;
+
+      const day = Number(match[1]);
+      const year = match[2] ? normalizeCalendarYear(match[2], fallbackYear) : fallbackYear;
+      const literal = toDateLiteral(year, monthInfo.month, day);
+      if (literal) return literal;
+    }
+  }
+
+  return null;
+}
+
+function parseThaiMonthOnly(text: string, fallbackYear: number): { month: string; year: string } | null {
+  const lowered = text.toLowerCase();
+
+  for (const monthInfo of THAI_MONTH_ALIASES) {
+    for (const alias of monthInfo.aliases) {
+      const pattern = new RegExp(`(?:เดือน\\s*)?${escapeRegExp(alias)}(?:\\s*(\\d{2,4}))?`, "i");
+      const match = lowered.match(pattern);
+      if (!match) continue;
+
+      const year = match[1] ? normalizeCalendarYear(match[1], fallbackYear) : fallbackYear;
+      return {
+        month: `${year}-${String(monthInfo.month).padStart(2, "0")}`,
+        year: String(year),
+      };
+    }
+  }
+
+  return null;
+}
+
+function parseRangeLiterals(text: string, fallbackYear: number): { from: string; to: string } | null {
+  const isoMatches = Array.from(text.matchAll(/\b\d{4}-\d{1,2}-\d{1,2}\b/g))
+    .map((entry) => parseIsoDateLiteral(entry[0]))
+    .filter((value): value is string => Boolean(value));
+
+  if (isoMatches.length >= 2) {
+    const sorted = [...isoMatches].sort();
+    return { from: sorted[0], to: sorted[sorted.length - 1] };
+  }
+
+  const slashMatches = Array.from(text.matchAll(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g))
+    .map((entry) => parseSlashDateLiteral(entry[0], fallbackYear))
+    .filter((value): value is string => Boolean(value));
+
+  if (slashMatches.length >= 2) {
+    const sorted = [...slashMatches].sort();
+    return { from: sorted[0], to: sorted[sorted.length - 1] };
+  }
+
+  return null;
+}
+
+function parseSummaryIntent(text: string): SummaryIntent {
+  const normalized = text.trim().toLowerCase();
+  const now = new Date();
+  const today = toBangkokDateLiteral(now);
+  const yesterday = toBangkokDateLiteral(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+  const fallbackYear = currentBangkokYear(now);
+
+  const hasSummaryKeyword =
+    /สรุป|ยอดรวม|รวมยอด|รวมให้|เท่าไหร่|เท่าไร|กี่บาท|summary|summarize|total|เช็คยอด|ดูรายจ่าย|ดูรายรับ|ดูธุรกรรม/u.test(
+      normalized
+    );
+  const hasFinanceKeyword = /รายจ่าย|ค่าใช้จ่าย|รายรับ|ธุรกรรม|expense|income|transaction/u.test(normalized);
+  const hasTimeOrScopeKeyword = /วันนี้|เมื่อวาน|วันที่|เดือน|ปี|ช่วง|ทั้งหมด|between|from|to|all/u.test(normalized);
+  const shouldSummarize = hasSummaryKeyword || (hasFinanceKeyword && hasTimeOrScopeKeyword);
+
+  const filter: SummaryFilter = {
+    mode: "day",
+    day: today,
+  };
+
+  if (/ทั้งหมด|all time|ทุกช่วง/u.test(normalized)) {
+    filter.mode = "all";
+    delete filter.day;
+  }
+
+  const range = parseRangeLiterals(normalized, fallbackYear);
+  if (range && /ถึง|between|from|to|ช่วง/u.test(normalized)) {
+    filter.mode = "range";
+    filter.from = range.from;
+    filter.to = range.to;
+    delete filter.day;
+  }
+
+  if (/เมื่อวาน|yesterday/u.test(normalized)) {
+    filter.mode = "day";
+    filter.day = yesterday;
+    delete filter.from;
+    delete filter.to;
+  } else if (/วันนี้|today/u.test(normalized)) {
+    filter.mode = "day";
+    filter.day = today;
+    delete filter.from;
+    delete filter.to;
+  }
+
+  const explicitIso = normalized.match(/\b\d{4}-\d{1,2}-\d{1,2}\b/);
+  if (explicitIso) {
+    const literal = parseIsoDateLiteral(explicitIso[0]);
+    if (literal) {
+      filter.mode = "day";
+      filter.day = literal;
+      delete filter.from;
+      delete filter.to;
+    }
+  }
+
+  const explicitSlash = normalized.match(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/);
+  if (explicitSlash) {
+    const literal = parseSlashDateLiteral(explicitSlash[0], fallbackYear);
+    if (literal) {
+      filter.mode = "day";
+      filter.day = literal;
+      delete filter.from;
+      delete filter.to;
+    }
+  }
+
+  const thaiLiteral = parseThaiMonthDateLiteral(normalized, fallbackYear);
+  if (thaiLiteral) {
+    filter.mode = "day";
+    filter.day = thaiLiteral;
+    delete filter.from;
+    delete filter.to;
+  }
+
+  if (/เดือนนี้|this month/u.test(normalized)) {
+    filter.mode = "month";
+    filter.month = today.slice(0, 7);
+    delete filter.day;
+    delete filter.from;
+    delete filter.to;
+  }
+
+  const monthInput = normalized.match(/เดือน\s*(\d{1,2})(?:\s*\/\s*(\d{2,4}))?/u);
+  if (monthInput) {
+    const month = Number(monthInput[1]);
+    if (month >= 1 && month <= 12) {
+      const year = monthInput[2] ? normalizeCalendarYear(monthInput[2], fallbackYear) : fallbackYear;
+      filter.mode = "month";
+      filter.month = `${year}-${String(month).padStart(2, "0")}`;
+      filter.year = String(year);
+      delete filter.day;
+      delete filter.from;
+      delete filter.to;
+    }
+  } else {
+    const thaiMonth = parseThaiMonthOnly(normalized, fallbackYear);
+    if (thaiMonth && !thaiLiteral) {
+      filter.mode = "month";
+      filter.month = thaiMonth.month;
+      filter.year = thaiMonth.year;
+      delete filter.day;
+      delete filter.from;
+      delete filter.to;
+    }
+  }
+
+  if (/ปีนี้|this year/u.test(normalized)) {
+    filter.mode = "year";
+    filter.year = String(fallbackYear);
+    delete filter.day;
+    delete filter.month;
+    delete filter.from;
+    delete filter.to;
+  }
+
+  const yearInput = normalized.match(/ปี\s*(\d{2,4})/u);
+  if (yearInput) {
+    filter.mode = "year";
+    filter.year = String(normalizeCalendarYear(yearInput[1], fallbackYear));
+    delete filter.day;
+    delete filter.month;
+    delete filter.from;
+    delete filter.to;
+  }
+
+  const hasIncomeHint = /รายรับ|income|รับเงิน/u.test(normalized);
+  const hasExpenseHint = /รายจ่าย|ค่าใช้จ่าย|expense|ใช้จ่าย/u.test(normalized);
+  if (hasIncomeHint && !hasExpenseHint) {
+    filter.type = "income";
+  } else if (hasExpenseHint && !hasIncomeHint) {
+    filter.type = "expense";
+  }
+
+  if (/อาหาร|food/u.test(normalized)) filter.category = "food";
+  if (/เดินทาง|transport|รถ|ค่าโดยสาร/u.test(normalized)) filter.category = "transport";
+  if (/ช้อป|shopping/u.test(normalized)) filter.category = "shopping";
+  if (/บิล|bill|ค่าน้ำ|ค่าไฟ|ค่าเน็ต/u.test(normalized)) filter.category = "bill";
+  if (/โอน|transfer/u.test(normalized)) filter.category = "transfer";
+
+  return { shouldSummarize, filter };
+}
+
+function buildSummaryQuery(filter: SummaryFilter, includePagination: boolean): URLSearchParams {
+  const qs = new URLSearchParams();
+  qs.set("mode", filter.mode);
+  if (filter.mode === "day" && filter.day) qs.set("day", filter.day);
+  if (filter.mode === "month" && filter.month) qs.set("month", filter.month);
+  if (filter.mode === "year" && filter.year) qs.set("year", filter.year);
+  if (filter.mode === "range") {
+    if (filter.from) qs.set("from", filter.from);
+    if (filter.to) qs.set("to", filter.to);
+  }
+  if (filter.type) qs.set("type", filter.type);
+  if (filter.category) qs.set("category", filter.category);
+  if (includePagination) {
+    qs.set("limit", "200");
+    qs.set("offset", "0");
+  }
+  return qs;
+}
+
+function parseSummaryBody(body: unknown): GatewaySummaryData {
+  if (!body || typeof body !== "object") {
+    return { totalExpense: 0, totalIncome: 0, balance: 0, categories: [] };
+  }
+  const row = body as Record<string, unknown>;
+  return {
+    totalExpense: typeof row.totalExpense === "number" ? row.totalExpense : 0,
+    totalIncome: typeof row.totalIncome === "number" ? row.totalIncome : 0,
+    balance: typeof row.balance === "number" ? row.balance : 0,
+    categories: Array.isArray(row.categories)
+      ? (row.categories as Array<{ category: string; total: number }>)
+      : [],
+  };
+}
+
+function parseTransactionsBody(body: unknown): GatewayTransactionRow[] {
+  const source = Array.isArray(body)
+    ? body
+    : body && typeof body === "object" && Array.isArray((body as { transactions?: unknown }).transactions)
+      ? ((body as { transactions: unknown[] }).transactions ?? [])
+      : [];
+
+  return source.map((entry, index) => {
+    const row = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : {};
+    const type = normalizeType(row.type);
+    return {
+      id: String(row.id ?? index),
+      item: cleanText(row.item) || "รายการ",
+      amount: normalizeAmount(row.amount),
+      type,
+      category: cleanText(row.category) || "other",
+      merchant: cleanText(row.merchant) || cleanText(row.item) || "ไม่ระบุร้าน",
+      datetime: cleanText(row.datetime),
+    };
+  });
+}
+
+function formatTHB(value: number): string {
+  return `THB ${Number(value || 0).toLocaleString("th-TH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatPeriodLabel(filter: SummaryFilter): string {
+  if (filter.mode === "day" && filter.day) {
+    const date = new Date(`${filter.day}T00:00:00+07:00`);
+    return `วันที่ ${date.toLocaleDateString("th-TH", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    })}`;
+  }
+  if (filter.mode === "month" && filter.month) return `เดือน ${filter.month}`;
+  if (filter.mode === "year" && filter.year) return `ปี ${filter.year}`;
+  if (filter.mode === "range") return `ช่วง ${filter.from ?? "?"} ถึง ${filter.to ?? "?"}`;
+  return "ทุกช่วงเวลา";
+}
+
+function normalizeCategoryLabel(category: string): string {
+  const key = category.toLowerCase();
+  if (key === "food") return "อาหาร";
+  if (key === "transport") return "เดินทาง";
+  if (key === "shopping") return "ช้อปปิ้ง";
+  if (key === "bill") return "บิล";
+  if (key === "transfer") return "โอน";
+  return category || "อื่นๆ";
+}
+
+async function parseGatewayResponseBody(response: Response): Promise<unknown> {
+  const raw = await response.text();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { raw };
+  }
+}
+
+async function summarizeFromGateway(filter: SummaryFilter): Promise<{ ok: boolean; reply: string; emotion: AssistantEmotion; error?: string }> {
+  const jar = await cookies();
+  const token = jar.get("auth_token")?.value ?? "";
+  if (!token) {
+    return {
+      ok: false,
+      reply: "ยังไม่พบสิทธิ์ผู้ใช้ กรุณาเข้าสู่ระบบใหม่ก่อนสรุปรายการ",
+      emotion: "concerned",
+      error: "missing auth token",
+    };
+  }
+
+  const summaryQuery = buildSummaryQuery(filter, false);
+  const transactionQuery = buildSummaryQuery(filter, true);
+
+  const [summaryRes, txRes] = await Promise.all([
+    fetch(`${GW}/api/v1/transactions/summary?${summaryQuery.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    }),
+    fetch(`${GW}/api/v1/transactions?${transactionQuery.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    }),
+  ]);
+
+  const [summaryBody, txBody] = await Promise.all([
+    parseGatewayResponseBody(summaryRes),
+    parseGatewayResponseBody(txRes),
+  ]);
+
+  if (!summaryRes.ok && !txRes.ok) {
+    const summaryError = extractGatewayErrorMessage(summaryBody);
+    const txError = extractGatewayErrorMessage(txBody);
+    return {
+      ok: false,
+      reply: "ดึงข้อมูลสรุปไม่สำเร็จ ลองใหม่อีกครั้งได้เลย",
+      emotion: "concerned",
+      error: summaryError || txError || `summary ${summaryRes.status} / tx ${txRes.status}`,
+    };
+  }
+
+  const summary = parseSummaryBody(summaryBody);
+  const txRows = parseTransactionsBody(txBody);
+
+  const computedTotals = txRows.reduce(
+    (acc, row) => {
+      if (row.type === "income") acc.totalIncome += row.amount;
+      else acc.totalExpense += row.amount;
+      return acc;
+    },
+    { totalIncome: 0, totalExpense: 0 }
+  );
+
+  const totalIncome = summaryRes.ok ? summary.totalIncome : computedTotals.totalIncome;
+  const totalExpense = summaryRes.ok ? summary.totalExpense : computedTotals.totalExpense;
+  const balance = summaryRes.ok ? summary.balance : totalIncome - totalExpense;
+
+  const periodLabel = formatPeriodLabel(filter);
+  if (txRows.length === 0) {
+    return {
+      ok: true,
+      reply: `ดึงข้อมูลจากระบบให้แล้ว (${periodLabel}) แต่ยังไม่พบรายการตามเงื่อนไขนี้`,
+      emotion: "neutral",
+    };
+  }
+
+  const categoryLines = summary.categories
+    .slice()
+    .sort((a, b) => Number(b.total || 0) - Number(a.total || 0))
+    .slice(0, 3)
+    .map((row) => `- ${normalizeCategoryLabel(String(row.category))}: ${formatTHB(Number(row.total || 0))}`);
+
+  const topType = filter.type === "income" ? "income" : "expense";
+  const topTx = txRows
+    .filter((row) => row.type === topType)
+    .sort((a, b) => b.amount - a.amount)[0];
+
+  const lines: string[] = [
+    `สรุปจากข้อมูลจริงในระบบ (${periodLabel})`,
+    `- จำนวนรายการ: ${txRows.length} รายการ`,
+    `- รายจ่ายรวม: ${formatTHB(totalExpense)}`,
+    `- รายรับรวม: ${formatTHB(totalIncome)}`,
+    `- คงเหลือสุทธิ: ${formatTHB(balance)}`,
+  ];
+
+  if (categoryLines.length > 0) {
+    lines.push("- หมวดที่ใช้สูงสุด:");
+    lines.push(...categoryLines);
+  }
+
+  if (topTx) {
+    lines.push(
+      `- รายการสูงสุด: ${topTx.merchant || topTx.item} ${formatTHB(topTx.amount)}`
+    );
+  }
+
+  return {
+    ok: true,
+    reply: lines.join("\n"),
+    emotion: "happy",
+  };
+}
 
 async function callOpenAI(messages: ChatMessage[], system?: string): Promise<string> {
   const response = await openai.responses.create({
@@ -456,6 +970,28 @@ export async function POST(request: NextRequest) {
         transaction: saveResult.transaction,
         mock: true,
       });
+    }
+
+    // ── Summary mode: read from gateway and summarize existing records ───────
+    if (!ocrText) {
+      const summaryIntent = parseSummaryIntent(lastUserMessage);
+      if (summaryIntent.shouldSummarize) {
+        const summaryResult = await summarizeFromGateway(summaryIntent.filter);
+        if (!summaryResult.ok) {
+          return Response.json({
+            reply: `ดึงข้อมูลสรุปไม่สำเร็จ: ${summaryResult.error ?? "unknown error"}`,
+            emotion: "concerned",
+            saved: false,
+          });
+        }
+
+        return Response.json({
+          reply: summaryResult.reply,
+          emotion: summaryResult.emotion,
+          saved: false,
+          summarized: true,
+        });
+      }
     }
 
     // ── Image mode: parse OCR → save transaction ──────────────────────────────

@@ -1,4 +1,4 @@
-﻿import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
 
 const GW = process.env.API_GATEWAY_URL || "http://localhost:4272";
@@ -13,12 +13,22 @@ async function readGatewayBody(res: Response): Promise<unknown> {
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const jar = await cookies();
   const token = jar.get("auth_token")?.value ?? "";
   if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const res = await fetch(`${GW}/api/v1/transactions/summary`, {
+  const { searchParams } = new URL(request.url);
+  const qs = new URLSearchParams();
+  const passthroughKeys = ["mode", "day", "month", "year", "from", "to", "type", "category"];
+
+  for (const key of passthroughKeys) {
+    const value = searchParams.get(key);
+    if (value !== null && value !== "") qs.set(key, value);
+  }
+
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const res = await fetch(`${GW}/api/v1/transactions/summary${suffix}`, {
     headers: { Authorization: `Bearer ${token}` },
     cache: "no-store",
   });

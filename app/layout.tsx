@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Sriracha } from "next/font/google";
 import { cookies } from "next/headers";
 import { jwtVerify } from "jose";
 import "./globals.css";
@@ -14,6 +14,13 @@ const geistSans = Geist({
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
+});
+
+const sriracha = Sriracha({
+  subsets: ["thai", "latin"],
+  weight: ["400"],
+  variable: "--font-sriracha",
+  display: "swap",
 });
 
 export const metadata: Metadata = {
@@ -71,13 +78,13 @@ export default async function RootLayout({
     <html
       lang="th"
       data-scroll-behavior="smooth"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${sriracha.variable} ${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full font-sans text-[color:var(--foreground)]">
         <div className="relative flex min-h-screen flex-col">
           {user && <NavBar username={user.username} />}
           <main className="relative z-10 flex flex-1 flex-col">{children}</main>
-          <PWAInstallPrompt />
+          {process.env.NODE_ENV === "production" ? <PWAInstallPrompt /> : null}
         </div>
       </body>
     </html>
