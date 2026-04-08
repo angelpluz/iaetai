@@ -76,11 +76,12 @@ export async function gatewayLogin(
 export async function gatewayRegister(
   email: string,
   username: string,
-  password: string
+  password: string,
+  whitelistRef: string
 ): Promise<LoginResponse> {
   return apiFetch<LoginResponse>("/api/v1/users/register", {
     method: "POST",
-    body: JSON.stringify({ email, username, password }),
+    body: JSON.stringify({ email, username, password, whitelistRef }),
   });
 }
 

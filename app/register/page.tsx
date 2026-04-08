@@ -13,6 +13,7 @@ const bullets = [
 export default function RegisterPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
+  const [whitelistRef, setWhitelistRef] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -33,13 +34,23 @@ export default function RegisterPage() {
       return;
     }
 
+    if (!whitelistRef.trim()) {
+      setError("Alpha whitelist key is required");
+      return;
+    }
+
     setLoading(true);
 
     try {
       const response = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, username, password }),
+        body: JSON.stringify({
+          email,
+          username,
+          password,
+          whitelistRef: whitelistRef.trim().toUpperCase(),
+        }),
       });
 
       const data = await response.json();
@@ -121,6 +132,19 @@ export default function RegisterPage() {
                   required
                   autoComplete="email"
                   className="w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm text-slate-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                />
+              </label>
+
+              <label className="block space-y-2">
+                <span className="text-sm font-medium text-slate-700">Alpha whitelist key</span>
+                <input
+                  type="text"
+                  value={whitelistRef}
+                  onChange={(event) => setWhitelistRef(event.target.value)}
+                  placeholder="ALPHA-XXXXX-XXXXX"
+                  required
+                  autoComplete="off"
+                  className="w-full rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-sm font-medium uppercase tracking-wide text-slate-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
                 />
               </label>
 

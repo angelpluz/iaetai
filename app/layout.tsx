@@ -1,9 +1,10 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { cookies } from "next/headers";
 import { jwtVerify } from "jose";
 import "./globals.css";
 import NavBar from "./NavBar";
+import PWAInstallPrompt from "./pwa-install-prompt";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -20,7 +21,28 @@ export const metadata: Metadata = {
     default: "IAET AI",
     template: "%s | IAET AI",
   },
+  applicationName: "IAET AI",
   description: "AI Expense Tracker",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "IAET AI",
+  },
+  icons: {
+    icon: [
+      { url: "/favicon.ico", sizes: "any", type: "image/x-icon" },
+      { url: "/icon-192x192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512x512.png", sizes: "512x512", type: "image/png" },
+    ],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#10233e",
 };
 
 async function getUser() {
@@ -55,6 +77,7 @@ export default async function RootLayout({
         <div className="relative flex min-h-screen flex-col">
           {user && <NavBar username={user.username} />}
           <main className="relative z-10 flex flex-1 flex-col">{children}</main>
+          <PWAInstallPrompt />
         </div>
       </body>
     </html>

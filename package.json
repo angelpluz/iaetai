@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "whitelist:generate": "node scripts/generate-alpha-whitelist-keys.mjs"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

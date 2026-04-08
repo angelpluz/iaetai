@@ -19,3 +19,14 @@ model Transaction {
   reference String?
   createdAt DateTime @default(now())
 }
+
+model AlphaWhitelistKey {
+  code           String   @id
+  isUsed         Boolean  @default(false)
+  usedByEmail    String?
+  usedByUsername String?
+  usedAt         DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([isUsed, createdAt])
+}
