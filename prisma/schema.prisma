@@ -30,3 +30,11 @@ model AlphaWhitelistKey {
 
   @@index([isUsed, createdAt])
 }
+
+model DashboardPreference {
+  userId    String   @id
+  lang      String   @default("th")
+  capsJson  String   @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

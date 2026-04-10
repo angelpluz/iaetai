@@ -208,37 +208,59 @@ function buildFilterQuery(filter: DashboardFilter): string {
   return qs.toString();
 }
 
+function sanitizeLanguage(value: unknown): Language {
+  return value === "en" ? "en" : "th";
+}
+
+function sanitizeCaps(value: unknown): BudgetCaps {
+  const input = value && typeof value === "object" ? (value as Partial<BudgetCaps>) : {};
+  const categoriesInput =
+    input.categories && typeof input.categories === "object"
+      ? (input.categories as Record<string, unknown>)
+      : {};
+
+  const mergedCategories: Record<string, number> = { ...DEFAULT_CAPS.categories };
+  for (const [key, raw] of Object.entries(categoriesInput)) {
+    const number = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(number) && number >= 0) {
+      mergedCategories[key] = number;
+    }
+  }
+
+  const customCategorySet = new Set<string>();
+  if (Array.isArray(input.customCategories)) {
+    for (const rawEntry of input.customCategories) {
+      const key = String(rawEntry).trim().toLowerCase();
+      if (!key || FIXED_CATEGORY_KEYS.includes(key as FixedCategoryKey)) continue;
+      customCategorySet.add(key);
+      if (!(key in mergedCategories)) mergedCategories[key] = 0;
+    }
+  }
+
+  const incomeCapNumber = typeof input.incomeCap === "number" ? input.incomeCap : Number(input.incomeCap ?? 0);
+  const incomeCap = Number.isFinite(incomeCapNumber) && incomeCapNumber >= 0 ? incomeCapNumber : 0;
+
+  return {
+    incomeCap,
+    categories: mergedCategories,
+    customCategories: Array.from(customCategorySet),
+  };
+}
+
+function hasCustomizedPreferences(lang: Language, caps: BudgetCaps): boolean {
+  if (lang !== "th") return true;
+  if (caps.incomeCap > 0) return true;
+  if (caps.customCategories.length > 0) return true;
+  return Object.values(caps.categories).some((value) => value > 0);
+}
+
 function readCapsFromStorage(): BudgetCaps {
   if (typeof window === "undefined") return DEFAULT_CAPS;
 
   try {
     const raw = window.localStorage.getItem(CAPS_STORAGE_KEY);
     if (!raw) return DEFAULT_CAPS;
-
-    const parsed = JSON.parse(raw) as Partial<BudgetCaps>;
-    const parsedCategories =
-      parsed.categories && typeof parsed.categories === "object"
-        ? (parsed.categories as Record<string, unknown>)
-        : {};
-
-    const mergedCategories: Record<string, number> = { ...DEFAULT_CAPS.categories };
-    for (const [key, value] of Object.entries(parsedCategories)) {
-      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-        mergedCategories[key] = value;
-      }
-    }
-
-    const customCategories = Array.isArray(parsed.customCategories)
-      ? parsed.customCategories
-          .map((value) => String(value).trim().toLowerCase())
-          .filter((value) => value.length > 0 && !FIXED_CATEGORY_KEYS.includes(value as FixedCategoryKey))
-      : [];
-
-    return {
-      incomeCap: typeof parsed.incomeCap === "number" ? Math.max(parsed.incomeCap, 0) : 0,
-      categories: mergedCategories,
-      customCategories,
-    };
+    return sanitizeCaps(JSON.parse(raw));
   } catch {
     return DEFAULT_CAPS;
   }
@@ -246,8 +268,24 @@ function readCapsFromStorage(): BudgetCaps {
 
 function readLanguageFromStorage(): Language {
   if (typeof window === "undefined") return "th";
-  const value = window.localStorage.getItem(LANG_STORAGE_KEY);
-  return value === "en" ? "en" : "th";
+  return sanitizeLanguage(window.localStorage.getItem(LANG_STORAGE_KEY));
+}
+
+async function fetchDashboardPreferences(): Promise<{ lang: Language; caps: BudgetCaps } | null> {
+  try {
+    const response = await fetch("/api/dashboard/preferences", {
+      cache: "no-store",
+    });
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as { lang?: unknown; caps?: unknown };
+    return {
+      lang: sanitizeLanguage(payload.lang),
+      caps: sanitizeCaps(payload.caps),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function getCategoryLabel(category: string, lang: Language): string {
@@ -331,8 +369,9 @@ export default function DashboardPage() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
-  const [lang, setLang] = useState<Language>(() => readLanguageFromStorage());
-  const [caps, setCaps] = useState<BudgetCaps>(() => readCapsFromStorage());
+  const [lang, setLang] = useState<Language>("th");
+  const [caps, setCaps] = useState<BudgetCaps>(DEFAULT_CAPS);
+  const [prefsReady, setPrefsReady] = useState(false);
   const [newCategoryInput, setNewCategoryInput] = useState("");
   const [filter, setFilter] = useState<DashboardFilter>(() => {
     const today = todayDateString();
@@ -376,13 +415,55 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    window.localStorage.setItem(CAPS_STORAGE_KEY, JSON.stringify(caps));
-  }, [caps]);
+
+    let cancelled = false;
+    async function loadPreferences() {
+      const localLang = readLanguageFromStorage();
+      const localCaps = readCapsFromStorage();
+      const remotePreferences = await fetchDashboardPreferences();
+
+      if (cancelled) return;
+
+      let nextLang = localLang;
+      let nextCaps = localCaps;
+      if (remotePreferences) {
+        const remoteCustomized = hasCustomizedPreferences(remotePreferences.lang, remotePreferences.caps);
+        const localCustomized = hasCustomizedPreferences(localLang, localCaps);
+        if (remoteCustomized || !localCustomized) {
+          nextLang = remotePreferences.lang;
+          nextCaps = remotePreferences.caps;
+        }
+      }
+
+      setLang(nextLang);
+      setCaps(nextCaps);
+      setPrefsReady(true);
+    }
+
+    void loadPreferences();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(LANG_STORAGE_KEY, lang);
-  }, [lang]);
+    if (typeof window === "undefined" || !prefsReady) return;
+
+    const timer = window.setTimeout(() => {
+      window.localStorage.setItem(CAPS_STORAGE_KEY, JSON.stringify(caps));
+      window.localStorage.setItem(LANG_STORAGE_KEY, lang);
+
+      void fetch("/api/dashboard/preferences", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ lang, caps }),
+      }).catch(() => undefined);
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [caps, lang, prefsReady]);
 
   const categoryFilterOptions = useMemo(() => {
     const values = new Set<string>(["all"]);
