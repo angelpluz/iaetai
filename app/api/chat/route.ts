@@ -6,10 +6,17 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
 });
-const RAW_MODEL =
+const RAW_CHAT_MODEL =
   process.env.OPENAI_MODEL ?? process.env.LARGE_MODEL ?? process.env.DEFAULT_MODEL ?? "gpt-5-nano";
-const MODEL = RAW_MODEL.replace(/^openai\//, "");
+const CHAT_MODEL = RAW_CHAT_MODEL.replace(/^openai\//, "");
+const RAW_EXTRACTION_MODEL =
+  process.env.EXTRACTION_MODEL ?? process.env.FAST_MODEL ?? process.env.SMALL_MODEL ?? "gpt-5-nano";
+const EXTRACTION_MODEL = RAW_EXTRACTION_MODEL.replace(/^openai\//, "");
 const GW = process.env.API_GATEWAY_URL || "http://localhost:4272";
+
+const TRANSACTION_CATEGORIES = ["food", "transport", "shopping", "bill", "transfer", "other"] as const;
+type TransactionCategory = (typeof TRANSACTION_CATEGORIES)[number];
+type TransactionType = "expense" | "income";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -22,8 +29,8 @@ type AssistantPersona = "friendly" | "professional" | "coach" | "playful";
 interface ParsedTransaction {
   item: string;
   amount: number;
-  type: string;
-  category: string;
+  type: TransactionType;
+  category: TransactionCategory;
   merchant: string;
   bank: string | null;
   datetime: string;
@@ -33,8 +40,8 @@ interface ParsedTransaction {
 interface TransactionPayload {
   item: string;
   amount: number;
-  type: string;
-  category: string;
+  type: TransactionType;
+  category: TransactionCategory;
   merchant: string;
   bank: string | null;
   datetime: string;
@@ -55,8 +62,8 @@ interface TextExtractionResult {
   shouldSave: boolean;
   item: string | null;
   amount: number | null;
-  type: "expense" | "income" | null;
-  category: "food" | "transport" | "shopping" | "bill" | "transfer" | "other" | null;
+  type: TransactionType | null;
+  category: TransactionCategory | null;
   merchant: string | null;
   bank: string | null;
   datetime: string | null;
@@ -98,20 +105,68 @@ interface GatewayTransactionRow {
   datetime: string;
 }
 
-const AI_PARSE_PROMPT = `Extract financial transaction data from OCR text. Fix OCR errors (O→0, l→1, "10o.00"→100.00).
-Return ONLY valid JSON, no extra text:
-{
-  "item": "description of the payment",
-  "amount": 100.00,
-  "type": "expense",
-  "category": "food|transport|shopping|bill|transfer|other",
-  "merchant": "store or sender name",
-  "bank": "bank name or null",
-  "datetime": "ISO datetime string (use today if not found)",
-  "reference": "transaction reference or null"
-}
+const TRANSACTION_RESPONSE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["item", "amount", "type", "category", "merchant", "bank", "datetime", "reference"],
+  properties: {
+    item: { type: "string" },
+    amount: { type: "number" },
+    type: { type: "string", enum: ["expense", "income"] },
+    category: { type: "string", enum: [...TRANSACTION_CATEGORIES] },
+    merchant: { type: "string" },
+    bank: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+    },
+    datetime: { type: "string" },
+    reference: {
+      anyOf: [{ type: "string" }, { type: "null" }],
+    },
+  },
+};
 
-OCR Text:
+const TEXT_EXTRACTION_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "shouldSave",
+    "item",
+    "amount",
+    "type",
+    "category",
+    "merchant",
+    "bank",
+    "datetime",
+    "reference",
+  ],
+  properties: {
+    shouldSave: { type: "boolean" },
+    item: { anyOf: [{ type: "string" }, { type: "null" }] },
+    amount: { anyOf: [{ type: "number" }, { type: "null" }] },
+    type: {
+      anyOf: [{ type: "string", enum: ["expense", "income"] }, { type: "null" }],
+    },
+    category: {
+      anyOf: [{ type: "string", enum: [...TRANSACTION_CATEGORIES] }, { type: "null" }],
+    },
+    merchant: { anyOf: [{ type: "string" }, { type: "null" }] },
+    bank: { anyOf: [{ type: "string" }, { type: "null" }] },
+    datetime: { anyOf: [{ type: "string" }, { type: "null" }] },
+    reference: { anyOf: [{ type: "string" }, { type: "null" }] },
+  },
+};
+
+const OCR_TEXT_PARSE_PROMPT = `Extract exactly one finalized financial transaction from OCR text.
+Fix common OCR issues (O→0, l→1, "10o.00"→100.00).
+
+Rules:
+- Return one transaction only.
+- Use the final paid/received amount (keywords like total, grand total, amount paid, net, ยอดสุทธิ, ยอดชำระ, จำนวนเงิน).
+- Ignore line-item prices, subtotal/tax/discount lines, and running balances.
+- If multiple totals exist, pick the amount the customer actually paid/received.
+- category must be one of: food, transport, shopping, bill, transfer, other.
+- If date/time missing, use current time.
+- bank/reference should be null when not shown.
 `;
 
 const CHAT_SYSTEM = `You are a helpful AI expense tracking assistant for Thai users.
@@ -140,19 +195,6 @@ const EMOTION_FORMAT_RULE = `Format rule:
 
 const TEXT_AUTO_SAVE_PROMPT = `You are a transaction intent detector for an expense tracking app.
 Given a single user message, decide if it should be auto-saved as a finished transaction.
-
-Return ONLY valid JSON:
-{
-  "shouldSave": true,
-  "item": "short description",
-  "amount": 100.5,
-  "type": "expense",
-  "category": "food|transport|shopping|bill|transfer|other",
-  "merchant": "merchant or person name",
-  "bank": null,
-  "datetime": null,
-  "reference": null
-}
 
 Rules:
 - shouldSave=true only when the message clearly states money already paid/received.
@@ -639,9 +681,9 @@ async function summarizeFromGateway(filter: SummaryFilter): Promise<{ ok: boolea
   };
 }
 
-async function callOpenAI(messages: ChatMessage[], system?: string): Promise<string> {
+async function callOpenAI(messages: ChatMessage[], system?: string, model = CHAT_MODEL): Promise<string> {
   const response = await openai.responses.create({
-    model: MODEL,
+    model,
     ...(system ? { instructions: system } : {}),
     input: messages.map((m) => ({ role: m.role, content: m.content })),
   });
@@ -701,13 +743,13 @@ function normalizeAmount(raw: unknown): number {
   return parseFloat(str) || 0;
 }
 
-function normalizeType(raw: unknown): "expense" | "income" {
+function normalizeType(raw: unknown): TransactionType {
   const text = String(raw ?? "").trim().toLowerCase();
   if (text === "income" || text === "รายรับ" || text === "รับเงิน") return "income";
   return "expense";
 }
 
-function normalizeCategory(raw: unknown): "food" | "transport" | "shopping" | "bill" | "transfer" | "other" {
+function normalizeCategory(raw: unknown): TransactionCategory {
   const text = String(raw ?? "").trim().toLowerCase();
   if (text === "food" || text.includes("อาหาร")) return "food";
   if (text === "transport" || text.includes("เดินทาง") || text.includes("ค่าโดยสาร")) return "transport";
@@ -721,28 +763,71 @@ function cleanText(raw: unknown): string {
   return String(raw ?? "").trim();
 }
 
-async function extractTransactionFromText(text: string): Promise<TextExtractionResult | null> {
-  const raw = await callOpenAI([
-    {
-      role: "user",
-      content: `${TEXT_AUTO_SAVE_PROMPT}\n\nUser message:\n${text}`,
+async function callStructuredResponse(
+  prompt: string,
+  schemaName: string,
+  schema: Record<string, unknown>,
+  model = EXTRACTION_MODEL
+): Promise<Record<string, unknown> | null> {
+  const response = await openai.responses.create({
+    model,
+    input: [{ role: "user", content: prompt }],
+    text: {
+      format: {
+        type: "json_schema",
+        name: schemaName,
+        strict: true,
+        schema,
+      },
     },
-  ]);
+  });
 
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) return null;
+  const raw = (response.output_text ?? "").trim();
+  if (!raw) return null;
 
-  let parsed: unknown = null;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as Record<string, unknown>;
   } catch {
     return null;
   }
+}
 
-  if (!parsed || typeof parsed !== "object") return null;
-  const obj = parsed as Record<string, unknown>;
+function toParsedTransaction(raw: Record<string, unknown>): ParsedTransaction {
+  const item = cleanText(raw.item) || "Payment";
+  return {
+    item,
+    amount: normalizeAmount(raw.amount),
+    type: normalizeType(raw.type),
+    category: normalizeCategory(raw.category),
+    merchant: cleanText(raw.merchant) || item,
+    bank: cleanText(raw.bank) || null,
+    datetime: cleanText(raw.datetime) || toBangkokIsoNoMs(new Date()),
+    reference: cleanText(raw.reference) || null,
+  };
+}
+
+async function parseTransactionFromOcrText(text: string): Promise<ParsedTransaction | null> {
+  const parsed = await callStructuredResponse(
+    `${OCR_TEXT_PARSE_PROMPT}\n\nOCR Text:\n${text}`,
+    "ocr_transaction",
+    TRANSACTION_RESPONSE_SCHEMA
+  );
+  if (!parsed) return null;
+  return toParsedTransaction(parsed);
+}
+
+async function extractTransactionFromText(text: string): Promise<TextExtractionResult | null> {
+  const obj = await callStructuredResponse(
+    `${TEXT_AUTO_SAVE_PROMPT}\n\nUser message:\n${text}`,
+    "text_autosave_transaction",
+    TEXT_EXTRACTION_SCHEMA
+  );
+  if (!obj) return null;
+
   const amount = obj.amount === null || obj.amount === undefined ? null : normalizeAmount(obj.amount);
-  const type = obj.type === "income" || obj.type === "expense" ? obj.type : null;
+  const type = obj.type === "income" || obj.type === "expense" ? (obj.type as TransactionType) : null;
   const category =
     obj.category === "food" ||
     obj.category === "transport" ||
@@ -750,7 +835,7 @@ async function extractTransactionFromText(text: string): Promise<TextExtractionR
     obj.category === "bill" ||
     obj.category === "transfer" ||
     obj.category === "other"
-      ? obj.category
+      ? (obj.category as TransactionCategory)
       : null;
 
   return {
@@ -764,6 +849,23 @@ async function extractTransactionFromText(text: string): Promise<TextExtractionR
     datetime: obj.datetime ? String(obj.datetime) : null,
     reference: obj.reference ? String(obj.reference) : null,
   };
+}
+
+function shouldAttemptTextAutoSave(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+
+  const hasAmount = /(?:^|[^\d])\d[\d,]*(?:\.\d{1,2})?(?:[^\d]|$)/u.test(normalized);
+  const hasMoneyWord = /บาท|baht|thb|฿/u.test(normalized);
+  const hasActionKeyword =
+    /จ่าย|ซื้อ|กิน|ค่า|เติม|โอน|รับเงิน|ได้รับ|paid|spent|bought|transfer|received|income|expense/u.test(
+      normalized
+    );
+  const looksLikeQuestionOrSummary = /\?|ไหม|มั้ย|หรือเปล่า|ช่วย|ควร|สรุป|summary|total|how|what|why/u.test(
+    normalized
+  );
+
+  return hasAmount && (hasMoneyWord || hasActionKeyword) && !looksLikeQuestionOrSummary;
 }
 
 function isMockSaveCommand(text: string): boolean {
@@ -806,12 +908,12 @@ function normalizeDatetime(input: string): string {
   try {
     const trimmed = String(input ?? "").trim();
     if (trimmed && trimmed !== "today" && !isNaN(Date.parse(trimmed))) {
-      return toBangkokIsoNoMs(new Date(trimmed));
+      return toSqlDatetime(new Date(trimmed));
     }
   } catch {
     // fall back to current time
   }
-  return toBangkokIsoNoMs(new Date());
+  return toSqlDatetime(new Date());
 }
 
 function extractGatewayErrorMessage(body: unknown): string | null {
@@ -863,17 +965,8 @@ async function saveTransactionToGateway(payload: TransactionPayload): Promise<Sa
         body: JSON.stringify(candidatePayload),
       });
 
-    let candidatePayload = normalizedPayload;
-    let gwRes = await sendPayload(candidatePayload);
-
-    // Gateway currently fails on datetime ending with "Z"; fallback to SQL datetime.
-    if (!gwRes.ok && gwRes.status >= 500 && typeof candidatePayload.datetime === "string") {
-      const fallbackDate = new Date(String(candidatePayload.datetime));
-      if (!isNaN(fallbackDate.getTime())) {
-        candidatePayload = { ...candidatePayload, datetime: toSqlDatetime(fallbackDate) };
-        gwRes = await sendPayload(candidatePayload);
-      }
-    }
+    const candidatePayload = normalizedPayload;
+    const gwRes = await sendPayload(candidatePayload);
 
     const rawBody = await gwRes.text();
     let body: unknown = null;
@@ -924,6 +1017,11 @@ export async function POST(request: NextRequest) {
   const body = await request.json();
   const messages: ChatMessage[] = body.messages ?? [];
   const ocrText: string | undefined = body.ocrText;
+  const parsedImageTransactionRaw: unknown = body.parsedImageTransaction;
+  const parsedImageTransaction =
+    parsedImageTransactionRaw && typeof parsedImageTransactionRaw === "object"
+      ? toParsedTransaction(parsedImageTransactionRaw as Record<string, unknown>)
+      : null;
   const personaRaw = String(body.persona ?? "friendly");
   const persona: AssistantPersona =
     personaRaw === "professional" || personaRaw === "coach" || personaRaw === "playful" || personaRaw === "friendly"
@@ -933,7 +1031,7 @@ export async function POST(request: NextRequest) {
 
   try {
     // ── Mock save mode: type /mock-save in chat to verify save pipeline ──────
-    if (!ocrText && isMockSaveCommand(lastUserMessage)) {
+    if (!ocrText && !parsedImageTransaction && isMockSaveCommand(lastUserMessage)) {
       const mockPayload: TransactionPayload = {
         item: "Mock transaction",
         amount: 123.45,
@@ -973,7 +1071,7 @@ export async function POST(request: NextRequest) {
     }
 
     // ── Summary mode: read from gateway and summarize existing records ───────
-    if (!ocrText) {
+    if (!ocrText && !parsedImageTransaction) {
       const summaryIntent = parseSummaryIntent(lastUserMessage);
       if (summaryIntent.shouldSummarize) {
         const summaryResult = await summarizeFromGateway(summaryIntent.filter);
@@ -995,26 +1093,12 @@ export async function POST(request: NextRequest) {
     }
 
     // ── Image mode: parse OCR → save transaction ──────────────────────────────
-    if (ocrText) {
-      const aiResponse = await callOpenAI([
-        { role: "user", content: AI_PARSE_PROMPT + ocrText },
-      ]);
+    if (parsedImageTransaction || ocrText) {
+      const parsed = parsedImageTransaction ?? (ocrText ? await parseTransactionFromOcrText(ocrText) : null);
 
-      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
+      if (!parsed) {
         return Response.json({
           reply: "อ่านสลิปได้ แต่ไม่สามารถแยกข้อมูลได้ กรุณาลองใหม่",
-          emotion: "concerned",
-          saved: false,
-        });
-      }
-
-      let parsed: ParsedTransaction;
-      try {
-        parsed = JSON.parse(jsonMatch[0]) as ParsedTransaction;
-      } catch {
-        return Response.json({
-          reply: "AI วิเคราะห์ข้อมูลไม่สำเร็จ กรุณาลองใหม่",
           emotion: "concerned",
           saved: false,
         });
@@ -1034,8 +1118,8 @@ export async function POST(request: NextRequest) {
       const saveResult = await saveTransactionToGateway({
         item: parsed.item || "Payment",
         amount,
-        type: parsed.type || "expense",
-        category: parsed.category || "other",
+        type: parsed.type,
+        category: parsed.category,
         merchant: parsed.merchant || "",
         bank: parsed.bank || null,
         datetime: normalizeDatetime(parsed.datetime),
@@ -1068,7 +1152,9 @@ export async function POST(request: NextRequest) {
 
     // ── Text auto-save mode ────────────────────────────────────────────────────
     if (lastUserMessage) {
-      const extracted = await extractTransactionFromText(lastUserMessage);
+      const extracted = shouldAttemptTextAutoSave(lastUserMessage)
+        ? await extractTransactionFromText(lastUserMessage)
+        : null;
 
       if (extracted?.shouldSave && (extracted.amount ?? 0) > 0) {
         const amount = extracted.amount ?? 0;

@@ -21,6 +21,17 @@ interface Transaction {
   createdAt: string;
 }
 
+interface ParsedImageTransaction {
+  item: string;
+  amount: number;
+  type: "expense" | "income";
+  category: "food" | "transport" | "shopping" | "bill" | "transfer" | "other";
+  merchant: string;
+  bank: string | null;
+  datetime: string;
+  reference: string | null;
+}
+
 interface ChatMsg {
   id: string;
   role: "user" | "assistant";
@@ -229,6 +240,7 @@ export default function ChatPage() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const sendingRef = useRef(false);
 
   const loadTransactions = useCallback(async () => {
     try {
@@ -271,8 +283,9 @@ export default function ChatPage() {
   }
 
   async function send() {
-    if (!input.trim() && !file) return;
+    if (sendingRef.current || (!input.trim() && !file)) return;
 
+    sendingRef.current = true;
     setSending(true);
 
     const pendingFile = file;
@@ -294,6 +307,7 @@ export default function ChatPage() {
 
     try {
       let ocrText: string | undefined;
+      let parsedImageTransaction: ParsedImageTransaction | undefined;
 
       if (pendingFile) {
         const formData = new FormData();
@@ -302,7 +316,14 @@ export default function ChatPage() {
 
         if (response.ok) {
           const data = await response.json();
+          parsedImageTransaction = data.result ?? undefined;
           ocrText = data.text || undefined;
+        } else {
+          throw new Error("OCR request failed");
+        }
+
+        if (!parsedImageTransaction && !ocrText) {
+          throw new Error("OCR returned empty payload");
         }
       }
 
@@ -312,6 +333,7 @@ export default function ChatPage() {
         body: JSON.stringify({
           messages: nextHistory.map((msg) => ({ role: msg.role, content: msg.content })),
           ocrText,
+          parsedImageTransaction,
           persona,
         }),
       });
@@ -342,6 +364,7 @@ export default function ChatPage() {
           })
       );
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   }
