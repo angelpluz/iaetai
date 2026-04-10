@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono, Sriracha } from "next/font/google";
+import { Geist, Geist_Mono, Sarabun } from "next/font/google";
 import { cookies } from "next/headers";
 import { jwtVerify } from "jose";
 import "./globals.css";
@@ -16,10 +16,10 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const sriracha = Sriracha({
+const sarabun = Sarabun({
   subsets: ["thai", "latin"],
-  weight: ["400"],
-  variable: "--font-sriracha",
+  weight: ["300", "400", "500", "600"],
+  variable: "--font-sarabun",
   display: "swap",
 });
 
@@ -78,7 +78,7 @@ export default async function RootLayout({
     <html
       lang="th"
       data-scroll-behavior="smooth"
-      className={`${sriracha.variable} ${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${sarabun.variable} ${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full font-sans text-[color:var(--foreground)]">
         <div className="relative flex min-h-screen flex-col">
