@@ -71,6 +71,7 @@ interface TextExtractionResult {
 }
 
 type SummaryMode = "all" | "day" | "month" | "year" | "range";
+type SummaryReplyStyle = "direct" | "assistant";
 
 interface SummaryFilter {
   mode: SummaryMode;
@@ -86,6 +87,7 @@ interface SummaryFilter {
 interface SummaryIntent {
   shouldSummarize: boolean;
   filter: SummaryFilter;
+  replyStyle: SummaryReplyStyle;
 }
 
 interface GatewaySummaryData {
@@ -103,6 +105,15 @@ interface GatewayTransactionRow {
   category: string;
   merchant: string;
   datetime: string;
+}
+
+interface GatewaySummaryContext {
+  summary: GatewaySummaryData;
+  txRows: GatewayTransactionRow[];
+  totalIncome: number;
+  totalExpense: number;
+  balance: number;
+  periodLabel: string;
 }
 
 const TRANSACTION_RESPONSE_SCHEMA: Record<string, unknown> = {
@@ -156,6 +167,39 @@ const TEXT_EXTRACTION_SCHEMA: Record<string, unknown> = {
   },
 };
 
+const SUMMARY_INTENT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "shouldSummarize",
+    "replyStyle",
+    "mode",
+    "day",
+    "month",
+    "year",
+    "from",
+    "to",
+    "type",
+    "category",
+  ],
+  properties: {
+    shouldSummarize: { type: "boolean" },
+    replyStyle: { type: "string", enum: ["direct", "assistant"] },
+    mode: { type: "string", enum: ["all", "day", "month", "year", "range"] },
+    day: { anyOf: [{ type: "string" }, { type: "null" }] },
+    month: { anyOf: [{ type: "string" }, { type: "null" }] },
+    year: { anyOf: [{ type: "string" }, { type: "null" }] },
+    from: { anyOf: [{ type: "string" }, { type: "null" }] },
+    to: { anyOf: [{ type: "string" }, { type: "null" }] },
+    type: {
+      anyOf: [{ type: "string", enum: ["expense", "income"] }, { type: "null" }],
+    },
+    category: {
+      anyOf: [{ type: "string", enum: [...TRANSACTION_CATEGORIES] }, { type: "null" }],
+    },
+  },
+};
+
 const OCR_TEXT_PARSE_PROMPT = `Extract exactly one finalized financial transaction from OCR text.
 Fix common OCR issues (O→0, l→1, "10o.00"→100.00).
 
@@ -168,6 +212,36 @@ Rules:
 - If date/time missing, use current time.
 - bank/reference should be null when not shown.
 `;
+
+const SUMMARY_INTENT_PROMPT = `You are an intent classifier for a personal finance assistant.
+Decide whether a user message should query the transaction database.
+
+Use shouldSummarize=true for:
+- totals, sums, balances
+- category/merchant rankings
+- "all data", "all transactions", lists, history
+- spending/income questions grounded in the user's saved records
+- advice or analysis that must use the saved transaction history
+
+Use replyStyle:
+- direct: simple totals/lists/summaries
+- assistant: natural questions, comparisons, explanations, advice, anomaly checks
+
+Category mapping:
+- fd, food, อาหาร => food
+- tr, transport, เดินทาง, รถ => transport
+- sh, shopping, ช้อป => shopping
+- bl, bill, บิล, ค่าน้ำ, ค่าไฟ, ค่าเน็ต => bill
+- tf, transfer, โอน => transfer
+
+Time interpretation:
+- "today" / "วันนี้" => day
+- "yesterday" / "เมื่อวาน" => day
+- "this month" / "เดือนนี้" => month
+- "this year" / "ปีนี้" => year
+- "all data" / "ทั้งหมด" / "ทุกรายการ" => all
+
+Today in Bangkok is {today}.`;
 
 const CHAT_SYSTEM = `You are a helpful AI expense tracking assistant for Thai users.
 Help users track expenses, answer questions about spending, and provide financial insights.
@@ -339,27 +413,55 @@ function parseRangeLiterals(text: string, fallbackYear: number): { from: string;
   return null;
 }
 
+function createDefaultSummaryFilter(today: string): SummaryFilter {
+  return {
+    mode: "day",
+    day: today,
+  };
+}
+
+function looksLikeConversationalFinanceQuestion(text: string): boolean {
+  return /ไหม|มั้ย|หรือเปล่า|ยังไง|อย่างไร|ทำไม|เพราะอะไร|ปัญหา|ผิดปกติ|แนะนำ|ควร|ช่วยดู|วิเคราะห์|เปรียบเทียบ|เทียบ|แนวโน้ม|แพงสุด|สูงสุด|ต่ำสุด|ไหน|อะไร|how|why|which|compare|trend|advice|anomaly|problem/u.test(
+    text
+  );
+}
+
+function looksLikePotentialDbFinanceQuestion(text: string): boolean {
+  return /ยอด|รวม|ทั้งหมด|ข้อมูล|รายการ|ธุรกรรม|รายจ่าย|รายรับ|ใช้เงิน|เงิน|หมวด|หมวดหมู่|ร้าน|merchant|category|food|transport|shopping|bill|transfer|expense|income|fd|tr|sh|bl|tf|อาหาร|เดินทาง|ช้อป|บิล|โอน/u.test(
+    text
+  );
+}
+
 function parseSummaryIntent(text: string): SummaryIntent {
   const normalized = text.trim().toLowerCase();
   const now = new Date();
   const today = toBangkokDateLiteral(now);
   const yesterday = toBangkokDateLiteral(new Date(now.getTime() - 24 * 60 * 60 * 1000));
   const fallbackYear = currentBangkokYear(now);
+  const replyStyle: SummaryReplyStyle = looksLikeConversationalFinanceQuestion(normalized) ? "assistant" : "direct";
 
   const hasSummaryKeyword =
-    /สรุป|ยอดรวม|รวมยอด|รวมให้|เท่าไหร่|เท่าไร|กี่บาท|summary|summarize|total|เช็คยอด|ดูรายจ่าย|ดูรายรับ|ดูธุรกรรม/u.test(
+    /สรุป|ยอดรวม|รวมยอด|รวมให้|(?:^|\s)รวม(?:\s|$)|เท่าไหร่|เท่าไร|กี่บาท|summary|summarize|total|sum|เช็คยอด|ดูรายจ่าย|ดูรายรับ|ดูธุรกรรม|ทั้งหมด/u.test(
       normalized
     );
-  const hasFinanceKeyword = /รายจ่าย|ค่าใช้จ่าย|รายรับ|ธุรกรรม|expense|income|transaction/u.test(normalized);
-  const hasTimeOrScopeKeyword = /วันนี้|เมื่อวาน|วันที่|เดือน|ปี|ช่วง|ทั้งหมด|between|from|to|all/u.test(normalized);
-  const shouldSummarize = hasSummaryKeyword || (hasFinanceKeyword && hasTimeOrScopeKeyword);
+  const hasFinanceKeyword =
+    /รายจ่าย|ค่าใช้จ่าย|รายรับ|ธุรกรรม|expense|income|transaction|food|transport|shopping|bill|transfer|อาหาร|เดินทาง|ช้อป|บิล|โอน|บาท|฿|thb|\bfd\b|\btr\b|\bsh\b|\bbl\b|\btf\b/u.test(
+      normalized
+    );
+  const hasTimeOrScopeKeyword = /วันนี้|เมื่อวาน|วันที่|เดือน|ปี|ช่วง|ทั้งหมด|between|from|to|all|month|year/u.test(
+    normalized
+  );
+  const hasAllDataKeyword = /ข้อมูลทั้งหมด|ทั้งหมดที่มี|all data|all transactions|ทุกธุรกรรม|ทุกรายการ/u.test(
+    normalized
+  );
+  const shouldSummarize =
+    hasAllDataKeyword ||
+    (hasSummaryKeyword && (hasFinanceKeyword || hasTimeOrScopeKeyword)) ||
+    (hasFinanceKeyword && hasTimeOrScopeKeyword);
 
-  const filter: SummaryFilter = {
-    mode: "day",
-    day: today,
-  };
+  const filter: SummaryFilter = createDefaultSummaryFilter(today);
 
-  if (/ทั้งหมด|all time|ทุกช่วง/u.test(normalized)) {
+  if (/ทั้งหมด|all time|ทุกช่วง|all data|all transactions|ทุกธุรกรรม|ทุกรายการ/u.test(normalized)) {
     filter.mode = "all";
     delete filter.day;
   }
@@ -465,21 +567,21 @@ function parseSummaryIntent(text: string): SummaryIntent {
     delete filter.to;
   }
 
-  const hasIncomeHint = /รายรับ|income|รับเงิน/u.test(normalized);
-  const hasExpenseHint = /รายจ่าย|ค่าใช้จ่าย|expense|ใช้จ่าย/u.test(normalized);
+  const hasIncomeHint = /รายรับ|income|รับเงิน|\binc\b/u.test(normalized);
+  const hasExpenseHint = /รายจ่าย|ค่าใช้จ่าย|expense|ใช้จ่าย|\bexp\b/u.test(normalized);
   if (hasIncomeHint && !hasExpenseHint) {
     filter.type = "income";
   } else if (hasExpenseHint && !hasIncomeHint) {
     filter.type = "expense";
   }
 
-  if (/อาหาร|food/u.test(normalized)) filter.category = "food";
-  if (/เดินทาง|transport|รถ|ค่าโดยสาร/u.test(normalized)) filter.category = "transport";
-  if (/ช้อป|shopping/u.test(normalized)) filter.category = "shopping";
-  if (/บิล|bill|ค่าน้ำ|ค่าไฟ|ค่าเน็ต/u.test(normalized)) filter.category = "bill";
-  if (/โอน|transfer/u.test(normalized)) filter.category = "transfer";
+  if (/\bfd\b|อาหาร|food/u.test(normalized)) filter.category = "food";
+  if (/\btr\b|เดินทาง|transport|รถ|ค่าโดยสาร/u.test(normalized)) filter.category = "transport";
+  if (/\bsh\b|ช้อป|shopping/u.test(normalized)) filter.category = "shopping";
+  if (/\bbl\b|บิล|bill|ค่าน้ำ|ค่าไฟ|ค่าเน็ต/u.test(normalized)) filter.category = "bill";
+  if (/\btf\b|โอน|transfer/u.test(normalized)) filter.category = "transfer";
 
-  return { shouldSummarize, filter };
+  return { shouldSummarize, filter, replyStyle };
 }
 
 function buildSummaryQuery(filter: SummaryFilter, includePagination: boolean): URLSearchParams {
@@ -577,7 +679,71 @@ async function parseGatewayResponseBody(response: Response): Promise<unknown> {
   }
 }
 
-async function summarizeFromGateway(filter: SummaryFilter): Promise<{ ok: boolean; reply: string; emotion: AssistantEmotion; error?: string }> {
+function normalizeSummaryIntentRecord(raw: Record<string, unknown>, fallbackToday: string): SummaryIntent {
+  const filter: SummaryFilter = createDefaultSummaryFilter(fallbackToday);
+
+  const mode =
+    raw.mode === "all" || raw.mode === "day" || raw.mode === "month" || raw.mode === "year" || raw.mode === "range"
+      ? raw.mode
+      : filter.mode;
+  filter.mode = mode;
+
+  const day = cleanText(raw.day);
+  const month = cleanText(raw.month);
+  const year = cleanText(raw.year);
+  const from = cleanText(raw.from);
+  const to = cleanText(raw.to);
+
+  if (mode === "all") {
+    delete filter.day;
+  } else if (mode === "day") {
+    filter.day = day || fallbackToday;
+  } else if (mode === "month") {
+    filter.month = month || fallbackToday.slice(0, 7);
+    delete filter.day;
+  } else if (mode === "year") {
+    filter.year = year || fallbackToday.slice(0, 4);
+    delete filter.day;
+  } else if (mode === "range") {
+    if (from) filter.from = from;
+    if (to) filter.to = to;
+    delete filter.day;
+  }
+
+  const type = raw.type === "expense" || raw.type === "income" ? raw.type : null;
+  if (type) filter.type = type;
+
+  const category =
+    raw.category === "food" ||
+    raw.category === "transport" ||
+    raw.category === "shopping" ||
+    raw.category === "bill" ||
+    raw.category === "transfer" ||
+    raw.category === "other"
+      ? raw.category
+      : null;
+  if (category) filter.category = category;
+
+  const replyStyle: SummaryReplyStyle = raw.replyStyle === "assistant" ? "assistant" : "direct";
+
+  return {
+    shouldSummarize: Boolean(raw.shouldSummarize),
+    filter,
+    replyStyle,
+  };
+}
+
+async function inferSummaryIntentWithAI(text: string): Promise<SummaryIntent | null> {
+  const today = toBangkokDateLiteral(new Date());
+  const prompt = `${SUMMARY_INTENT_PROMPT.replace("{today}", today)}\n\nUser message:\n${text}`;
+  const raw = await callStructuredResponse(prompt, "summary_intent", SUMMARY_INTENT_SCHEMA);
+  if (!raw) return null;
+  return normalizeSummaryIntentRecord(raw, today);
+}
+
+async function loadGatewaySummaryContext(
+  filter: SummaryFilter
+): Promise<{ ok: boolean; data?: GatewaySummaryContext; error?: string; reply?: string; emotion?: AssistantEmotion }> {
   const jar = await cookies();
   const token = jar.get("auth_token")?.value ?? "";
   if (!token) {
@@ -634,33 +800,87 @@ async function summarizeFromGateway(filter: SummaryFilter): Promise<{ ok: boolea
   const totalIncome = summaryRes.ok ? summary.totalIncome : computedTotals.totalIncome;
   const totalExpense = summaryRes.ok ? summary.totalExpense : computedTotals.totalExpense;
   const balance = summaryRes.ok ? summary.balance : totalIncome - totalExpense;
-
   const periodLabel = formatPeriodLabel(filter);
-  if (txRows.length === 0) {
+
+  return {
+    ok: true,
+    data: {
+      summary,
+      txRows,
+      totalIncome,
+      totalExpense,
+      balance,
+      periodLabel,
+    },
+  };
+}
+
+function buildFinanceContextBlock(context: GatewaySummaryContext): string {
+  const categoryLines = context.summary.categories
+    .slice()
+    .sort((a, b) => Number(b.total || 0) - Number(a.total || 0))
+    .slice(0, 5)
+    .map((row) => `- ${normalizeCategoryLabel(String(row.category))}: ${formatTHB(Number(row.total || 0))}`);
+
+  const transactionLines = context.txRows
+    .slice()
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, 12)
+    .map((row) => {
+      const date = cleanText(row.datetime);
+      return `- ${row.merchant || row.item} | ${row.type} | ${normalizeCategoryLabel(row.category)} | ${formatTHB(row.amount)} | ${date}`;
+    });
+
+  return [
+    `ช่วงข้อมูล: ${context.periodLabel}`,
+    `จำนวนรายการ: ${context.txRows.length}`,
+    `รายจ่ายรวม: ${formatTHB(context.totalExpense)}`,
+    `รายรับรวม: ${formatTHB(context.totalIncome)}`,
+    `คงเหลือสุทธิ: ${formatTHB(context.balance)}`,
+    "หมวดหลัก:",
+    ...(categoryLines.length > 0 ? categoryLines : ["- ไม่มีข้อมูลหมวด"]),
+    "รายการอ้างอิง:",
+    ...(transactionLines.length > 0 ? transactionLines : ["- ไม่มีรายการ"]),
+  ].join("\n");
+}
+
+async function summarizeFromGateway(filter: SummaryFilter): Promise<{ ok: boolean; reply: string; emotion: AssistantEmotion; error?: string }> {
+  const loaded = await loadGatewaySummaryContext(filter);
+  if (!loaded.ok) {
+    return {
+      ok: false,
+      reply: loaded.reply ?? "ดึงข้อมูลสรุปไม่สำเร็จ ลองใหม่อีกครั้งได้เลย",
+      emotion: loaded.emotion ?? "concerned",
+      error: loaded.error,
+    };
+  }
+
+  const context = loaded.data as GatewaySummaryContext;
+  if (context.txRows.length === 0) {
     return {
       ok: true,
-      reply: `ดึงข้อมูลจากระบบให้แล้ว (${periodLabel}) แต่ยังไม่พบรายการตามเงื่อนไขนี้`,
+      reply: `ดึงข้อมูลจากระบบให้แล้ว (${context.periodLabel}) แต่ยังไม่พบรายการตามเงื่อนไขนี้`,
       emotion: "neutral",
     };
   }
 
-  const categoryLines = summary.categories
+  const categoryLines = context.summary.categories
     .slice()
     .sort((a, b) => Number(b.total || 0) - Number(a.total || 0))
     .slice(0, 3)
     .map((row) => `- ${normalizeCategoryLabel(String(row.category))}: ${formatTHB(Number(row.total || 0))}`);
 
   const topType = filter.type === "income" ? "income" : "expense";
-  const topTx = txRows
+  const topTx = context.txRows
     .filter((row) => row.type === topType)
     .sort((a, b) => b.amount - a.amount)[0];
 
   const lines: string[] = [
-    `สรุปจากข้อมูลจริงในระบบ (${periodLabel})`,
-    `- จำนวนรายการ: ${txRows.length} รายการ`,
-    `- รายจ่ายรวม: ${formatTHB(totalExpense)}`,
-    `- รายรับรวม: ${formatTHB(totalIncome)}`,
-    `- คงเหลือสุทธิ: ${formatTHB(balance)}`,
+    `สรุปจากข้อมูลจริงในระบบ (${context.periodLabel})`,
+    `- จำนวนรายการ: ${context.txRows.length} รายการ`,
+    `- รายจ่ายรวม: ${formatTHB(context.totalExpense)}`,
+    `- รายรับรวม: ${formatTHB(context.totalIncome)}`,
+    `- คงเหลือสุทธิ: ${formatTHB(context.balance)}`,
   ];
 
   if (categoryLines.length > 0) {
@@ -678,6 +898,58 @@ async function summarizeFromGateway(filter: SummaryFilter): Promise<{ ok: boolea
     ok: true,
     reply: lines.join("\n"),
     emotion: "happy",
+  };
+}
+
+async function answerFinanceQuestionFromGateway(
+  question: string,
+  filter: SummaryFilter,
+  persona: AssistantPersona
+): Promise<{ ok: boolean; reply: string; emotion: AssistantEmotion; error?: string }> {
+  const loaded = await loadGatewaySummaryContext(filter);
+  if (!loaded.ok) {
+    return {
+      ok: false,
+      reply: loaded.reply ?? "ดึงข้อมูลจากระบบไม่สำเร็จ",
+      emotion: loaded.emotion ?? "concerned",
+      error: loaded.error,
+    };
+  }
+
+  const context = loaded.data as GatewaySummaryContext;
+  if (context.txRows.length === 0) {
+    return {
+      ok: true,
+      reply: `ดึงข้อมูลจากระบบให้แล้ว (${context.periodLabel}) แต่ยังไม่พบรายการตามเงื่อนไขนี้`,
+      emotion: "neutral",
+    };
+  }
+
+  const system = [
+    CHAT_SYSTEM,
+    personaInstruction(persona),
+    "You are answering with real transaction data from the app database.",
+    "Use only the provided data context. Do not invent transactions or totals.",
+    "Answer naturally in the same language as the user.",
+    "Be concise but human. If the user asks for advice, ground it in the actual data.",
+    EMOTION_FORMAT_RULE,
+  ].join("\n");
+
+  const raw = await callOpenAI(
+    [
+      {
+        role: "user",
+        content: `User question:\n${question}\n\nDatabase context:\n${buildFinanceContextBlock(context)}`,
+      },
+    ],
+    system
+  );
+
+  const parsed = extractEmotionAndText(raw);
+  return {
+    ok: true,
+    reply: parsed.text,
+    emotion: parsed.emotion,
   };
 }
 
@@ -1072,9 +1344,19 @@ export async function POST(request: NextRequest) {
 
     // ── Summary mode: read from gateway and summarize existing records ───────
     if (!ocrText && !parsedImageTransaction) {
-      const summaryIntent = parseSummaryIntent(lastUserMessage);
+      let summaryIntent = parseSummaryIntent(lastUserMessage);
+      if (!summaryIntent.shouldSummarize && looksLikePotentialDbFinanceQuestion(lastUserMessage)) {
+        const aiSummaryIntent = await inferSummaryIntentWithAI(lastUserMessage);
+        if (aiSummaryIntent?.shouldSummarize) {
+          summaryIntent = aiSummaryIntent;
+        }
+      }
+
       if (summaryIntent.shouldSummarize) {
-        const summaryResult = await summarizeFromGateway(summaryIntent.filter);
+        const summaryResult =
+          summaryIntent.replyStyle === "assistant"
+            ? await answerFinanceQuestionFromGateway(lastUserMessage, summaryIntent.filter, persona)
+            : await summarizeFromGateway(summaryIntent.filter);
         if (!summaryResult.ok) {
           return Response.json({
             reply: `ดึงข้อมูลสรุปไม่สำเร็จ: ${summaryResult.error ?? "unknown error"}`,
