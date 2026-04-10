@@ -1,7 +1,5 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
-import { jwtVerify } from "jose";
-import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
@@ -12,6 +10,9 @@ type BudgetCaps = {
   customCategories: string[];
 };
 
+const GW = process.env.API_GATEWAY_URL || "http://localhost:4272";
+const DASHBOARD_PREFERENCES_PATH =
+  process.env.API_DASHBOARD_PREFERENCES_PATH || "/api/v1/users/preferences";
 const FIXED_CATEGORY_KEYS = ["food", "transport", "shopping", "bill", "transfer", "other"] as const;
 
 const DEFAULT_CAPS: BudgetCaps = {
@@ -66,71 +67,95 @@ function sanitizeCaps(value: unknown): BudgetCaps {
   };
 }
 
-async function getUserIdFromCookie(): Promise<string | null> {
-  const cookieStore = await cookies();
-  const token = cookieStore.get("auth_token")?.value;
-  if (!token) return null;
-
+async function readGatewayBody(res: Response): Promise<unknown> {
+  const raw = await res.text();
+  if (!raw) return null;
   try {
-    const secret = new TextEncoder().encode(process.env.JWT_SECRET ?? "");
-    const { payload } = await jwtVerify(token, secret);
-    return typeof payload.sub === "string" && payload.sub.trim() ? payload.sub : null;
+    return JSON.parse(raw);
   } catch {
-    return null;
+    return { raw };
   }
 }
 
+async function getToken(): Promise<string> {
+  const jar = await cookies();
+  return jar.get("auth_token")?.value ?? "";
+}
+
+function pickPreferencesPayload(body: unknown): { lang: unknown; caps: unknown } {
+  const fallback = { lang: "th", caps: DEFAULT_CAPS };
+  if (!body || typeof body !== "object") return fallback;
+
+  const root = body as Record<string, unknown>;
+  const data = root.data && typeof root.data === "object" ? (root.data as Record<string, unknown>) : null;
+  const candidate = data ?? root;
+
+  return {
+    lang: candidate.lang,
+    caps: candidate.caps,
+  };
+}
+
 export async function GET() {
-  const userId = await getUserIdFromCookie();
-  if (!userId) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const token = await getToken();
+  if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const res = await fetch(`${GW}${DASHBOARD_PREFERENCES_PATH}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: "no-store",
+  });
+
+  const body = await readGatewayBody(res);
+  if (res.status === 404 || res.status === 405) {
+    return NextResponse.json({ lang: "th", caps: DEFAULT_CAPS, source: "fallback" });
   }
 
-  const pref = await prisma.dashboardPreference.findUnique({ where: { userId } });
-  if (!pref) {
-    return NextResponse.json({
-      lang: "th",
-      caps: DEFAULT_CAPS,
-    });
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: "Gateway error", gatewayStatus: res.status, gatewayError: body },
+      { status: res.status }
+    );
   }
 
-  let parsedCaps: unknown = DEFAULT_CAPS;
-  try {
-    parsedCaps = JSON.parse(pref.capsJson);
-  } catch {
-    parsedCaps = DEFAULT_CAPS;
-  }
-
+  const payload = pickPreferencesPayload(body);
   return NextResponse.json({
-    lang: sanitizeLanguage(pref.lang),
-    caps: sanitizeCaps(parsedCaps),
+    lang: sanitizeLanguage(payload.lang),
+    caps: sanitizeCaps(payload.caps),
   });
 }
 
 export async function PUT(request: Request) {
-  const userId = await getUserIdFromCookie();
-  if (!userId) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const token = await getToken();
+  if (!token) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const body = await request.json().catch(() => ({}));
-  const payload = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const raw = await request.json().catch(() => ({}));
+  const body = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 
-  const lang = sanitizeLanguage(payload.lang);
-  const caps = sanitizeCaps(payload.caps);
+  const payload = {
+    lang: sanitizeLanguage(body.lang),
+    caps: sanitizeCaps(body.caps),
+  };
 
-  await prisma.dashboardPreference.upsert({
-    where: { userId },
-    update: {
-      lang,
-      capsJson: JSON.stringify(caps),
+  const res = await fetch(`${GW}${DASHBOARD_PREFERENCES_PATH}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
-    create: {
-      userId,
-      lang,
-      capsJson: JSON.stringify(caps),
-    },
+    body: JSON.stringify(payload),
   });
 
-  return NextResponse.json({ ok: true });
+  if (res.status === 404 || res.status === 405) {
+    return NextResponse.json({ ok: false, unsupported: true, source: "fallback" });
+  }
+
+  const responseBody = await readGatewayBody(res);
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: "Gateway error", gatewayStatus: res.status, gatewayError: responseBody },
+      { status: res.status }
+    );
+  }
+
+  return NextResponse.json({ ok: true, data: responseBody ?? null });
 }
