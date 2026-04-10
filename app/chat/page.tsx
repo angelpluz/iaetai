@@ -32,6 +32,15 @@ interface ParsedImageTransaction {
   reference: string | null;
 }
 
+interface ImageAnalysisResult {
+  kind: "financial_document" | "visual_item" | "other";
+  summary: string;
+  canAutoSave: boolean;
+  suggestedItem: string | null;
+  suggestedCategory: "food" | "transport" | "shopping" | "bill" | "transfer" | "other" | null;
+  transaction: ParsedImageTransaction | null;
+}
+
 interface ChatMsg {
   id: string;
   role: "user" | "assistant";
@@ -43,8 +52,24 @@ interface ChatMsg {
   loading?: boolean;
 }
 
+interface MeResponse {
+  user?: {
+    uid?: string | null;
+    email?: string | null;
+    username?: string | null;
+  } | null;
+}
+
 const AVATAR_STORAGE_KEY = "iaet:chat-avatar:v1";
 const PERSONA_STORAGE_KEY = "iaet:chat-persona:v1";
+const CHAT_HISTORY_STORAGE_PREFIX = "iaet:chat-history:v1:";
+const MAX_STORED_MESSAGES = 60;
+const WELCOME_MESSAGE: ChatMsg = {
+  id: "welcome",
+  role: "assistant",
+  content: "เธชเธงเธฑเธชเธ”เธต เธชเนเธเธเนเธญเธเธงเธฒเธกเธซเธฃเธทเธญเธชเธฅเธดเธเธกเธฒเนเธ”เนเน€เธฅเธข เธเธฑเธเธเธฐเธเนเธงเธขเธญเนเธฒเธเธฃเธฒเธขเธเธฒเธฃเนเธฅเธฐเธเธฑเธเธ—เธถเธเนเธซเนเนเธเธเธฅเธทเนเธเน",
+  emotion: "friendly",
+};
 const QUICK_PROMPTS = [
   "ช่วยสรุปรายจ่ายวันนี้ให้หน่อย",
   "เพิ่มค่าอาหาร 120 บาท",
@@ -162,6 +187,43 @@ function readAvatarFromStorage(): AssistantAvatar {
   return value === "male" ? "male" : "female";
 }
 
+function sanitizeMessagesForStorage(messages: ChatMsg[]): ChatMsg[] {
+  return messages
+    .filter((msg) => !msg.loading)
+    .slice(-MAX_STORED_MESSAGES)
+    .map((msg) => ({
+      ...msg,
+      imagePreview: msg.imagePreview?.startsWith("data:") ? msg.imagePreview : undefined,
+    }));
+}
+
+function readChatHistory(historyKey: string): ChatMsg[] {
+  if (typeof window === "undefined") return [WELCOME_MESSAGE];
+  const raw = window.localStorage.getItem(`${CHAT_HISTORY_STORAGE_PREFIX}${historyKey}`);
+  if (!raw) return [WELCOME_MESSAGE];
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [WELCOME_MESSAGE];
+
+    const items = parsed.filter((entry) => entry && typeof entry === "object") as ChatMsg[];
+    return items.length > 0 ? items : [WELCOME_MESSAGE];
+  } catch {
+    return [WELCOME_MESSAGE];
+  }
+}
+
+async function fetchHistoryKey(): Promise<string> {
+  try {
+    const response = await fetch("/api/auth/me", { cache: "no-store" });
+    if (!response.ok) return "guest";
+    const data = (await response.json()) as MeResponse;
+    return data.user?.uid || data.user?.email || data.user?.username || "guest";
+  } catch {
+    return "guest";
+  }
+}
+
 function TxCard({ tx }: { tx: Transaction }) {
   return (
     <div className="mt-1 max-w-sm rounded-[24px] border border-emerald-200 bg-emerald-50/95 p-4 shadow-sm">
@@ -237,6 +299,8 @@ export default function ChatPage() {
   const [persona, setPersona] = useState<AssistantPersona>(() => readPersonaFromStorage());
   const [avatar, setAvatar] = useState<AssistantAvatar>(() => readAvatarFromStorage());
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [historyKey, setHistoryKey] = useState<string | null>(null);
+  const [historyReady, setHistoryReady] = useState(false);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -257,6 +321,21 @@ export default function ChatPage() {
   }, [loadTransactions]);
 
   useEffect(() => {
+    let active = true;
+
+    void fetchHistoryKey().then((key) => {
+      if (!active) return;
+      setHistoryKey(key);
+      setMsgs(readChatHistory(key));
+      setHistoryReady(true);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [msgs]);
 
@@ -269,6 +348,14 @@ export default function ChatPage() {
     if (typeof window === "undefined") return;
     window.localStorage.setItem(AVATAR_STORAGE_KEY, avatar);
   }, [avatar]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !historyReady || !historyKey) return;
+    window.localStorage.setItem(
+      `${CHAT_HISTORY_STORAGE_PREFIX}${historyKey}`,
+      JSON.stringify(sanitizeMessagesForStorage(msgs))
+    );
+  }, [historyKey, historyReady, msgs]);
 
   function onFile(event: React.ChangeEvent<HTMLInputElement>) {
     const nextFile = event.target.files?.[0] ?? null;
@@ -306,8 +393,7 @@ export default function ChatPage() {
     clearFile();
 
     try {
-      let ocrText: string | undefined;
-      let parsedImageTransaction: ParsedImageTransaction | undefined;
+      let imageAnalysis: ImageAnalysisResult | undefined;
 
       if (pendingFile) {
         const formData = new FormData();
@@ -316,13 +402,12 @@ export default function ChatPage() {
 
         if (response.ok) {
           const data = await response.json();
-          parsedImageTransaction = data.result ?? undefined;
-          ocrText = data.text || undefined;
+          imageAnalysis = data.analysis ?? undefined;
         } else {
           throw new Error("OCR request failed");
         }
 
-        if (!parsedImageTransaction && !ocrText) {
+        if (!imageAnalysis) {
           throw new Error("OCR returned empty payload");
         }
       }
@@ -332,8 +417,7 @@ export default function ChatPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           messages: nextHistory.map((msg) => ({ role: msg.role, content: msg.content })),
-          ocrText,
-          parsedImageTransaction,
+          imageAnalysis,
           persona,
         }),
       });

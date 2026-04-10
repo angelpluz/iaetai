@@ -37,6 +37,15 @@ interface ParsedTransaction {
   reference: string | null;
 }
 
+interface ImageAnalysisResult {
+  kind: "financial_document" | "visual_item" | "other";
+  summary: string;
+  canAutoSave: boolean;
+  suggestedItem: string | null;
+  suggestedCategory: TransactionCategory | null;
+  transaction: ParsedTransaction | null;
+}
+
 interface TransactionPayload {
   item: string;
   amount: number;
@@ -268,13 +277,18 @@ const EMOTION_FORMAT_RULE = `Format rule:
 - Keep response concise and conversational.`;
 
 const TEXT_AUTO_SAVE_PROMPT = `You are a transaction intent detector for an expense tracking app.
-Given a single user message, decide if it should be auto-saved as a finished transaction.
+Use the recent conversation context to understand the latest user message.
+If the latest user message is just a price or short confirmation, you may use the previous conversation to infer the item/category.
 
 Rules:
 - shouldSave=true only when the message clearly states money already paid/received.
 - shouldSave=false for questions, plans, reminders, or unclear amounts.
 - amount must be number (no currency symbols). If unknown use null.
-- type must be "expense" or "income".`;
+- type must be "expense" or "income".
+- category must be one of: food, transport, shopping, bill, transfer, other.
+- bill examples: utilities, phone, internet, subscriptions, invoices.
+- shopping examples: clothes, cosmetics, gadgets, groceries, household items.
+- A photo of food or an assistant message describing food should usually map to category food, not bill.`;
 
 const THAI_MONTH_ALIASES: Array<{ month: number; aliases: string[] }> = [
   { month: 1, aliases: ["มกราคม", "มกรา", "ม.ค.", "มค", "jan", "january"] },
@@ -1007,6 +1021,29 @@ function extractEmotionAndText(raw: string): { text: string; emotion: AssistantE
   };
 }
 
+function describeSuggestedCategory(category: TransactionCategory | null): string {
+  if (category === "food") return "food";
+  if (category === "transport") return "transport";
+  if (category === "shopping") return "shopping";
+  if (category === "bill") return "bill";
+  if (category === "transfer") return "transfer";
+  return "other";
+}
+
+function buildImageAnalysisReply(analysis: ImageAnalysisResult): { text: string; emotion: AssistantEmotion } {
+  const suggestion =
+    analysis.suggestedItem || analysis.suggestedCategory
+      ? `ถ้าจะบันทึก บอกราคาได้เลย เดี๋ยวผมตั้งเป็น ${analysis.suggestedItem || "รายการนี้"} หมวด ${describeSuggestedCategory(
+          analysis.suggestedCategory
+        )} ให้`
+      : "ถ้าจะบันทึก บอกราคาและรายละเอียดเพิ่มได้เลย เดี๋ยวผมช่วยจัดหมวดให้";
+
+  return {
+    text: `${analysis.summary}\n${suggestion}`,
+    emotion: analysis.kind === "visual_item" ? "friendly" : "neutral",
+  };
+}
+
 function normalizeAmount(raw: unknown): number {
   if (typeof raw === "number") return raw;
   const str = String(raw ?? "0")
@@ -1023,10 +1060,52 @@ function normalizeType(raw: unknown): TransactionType {
 
 function normalizeCategory(raw: unknown): TransactionCategory {
   const text = String(raw ?? "").trim().toLowerCase();
-  if (text === "food" || text.includes("อาหาร")) return "food";
-  if (text === "transport" || text.includes("เดินทาง") || text.includes("ค่าโดยสาร")) return "transport";
-  if (text === "shopping" || text.includes("ช้อป")) return "shopping";
-  if (text === "bill" || text.includes("บิล") || text.includes("ค่าน้ำ") || text.includes("ค่าไฟ")) return "bill";
+  if (
+    text === "food" ||
+    text.includes("อาหาร") ||
+    text.includes("ข้าว") ||
+    text.includes("กาแฟ") ||
+    text.includes("ของกิน") ||
+    text.includes("มื้อ")
+  ) {
+    return "food";
+  }
+  if (
+    text === "transport" ||
+    text.includes("เดินทาง") ||
+    text.includes("ค่าโดยสาร") ||
+    text.includes("รถ") ||
+    text.includes("taxi") ||
+    text.includes("grab")
+  ) {
+    return "transport";
+  }
+  if (
+    text === "shopping" ||
+    text.includes("ช้อป") ||
+    text.includes("เสื้อผ้า") ||
+    text.includes("รองเท้า") ||
+    text.includes("เครื่องสำอาง") ||
+    text.includes("ของใช้") ||
+    text.includes("gadget") ||
+    text.includes("grocer")
+  ) {
+    return "shopping";
+  }
+  if (
+    text === "bill" ||
+    text.includes("บิล") ||
+    text.includes("invoice") ||
+    text.includes("subscription") ||
+    text.includes("utility") ||
+    text.includes("ค่าน้ำ") ||
+    text.includes("ค่าไฟ") ||
+    text.includes("ค่าเน็ต") ||
+    text.includes("ค่าโทร") ||
+    text.includes("โทรศัพท์")
+  ) {
+    return "bill";
+  }
   if (text === "transfer" || text.includes("โอน")) return "transfer";
   return "other";
 }
@@ -1090,9 +1169,19 @@ async function parseTransactionFromOcrText(text: string): Promise<ParsedTransact
   return toParsedTransaction(parsed);
 }
 
-async function extractTransactionFromText(text: string): Promise<TextExtractionResult | null> {
+function buildRecentConversationForExtraction(messages: ChatMessage[]): string {
+  return messages
+    .slice(-6)
+    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.content}`)
+    .join("\n");
+}
+
+async function extractTransactionFromText(
+  text: string,
+  messages: ChatMessage[]
+): Promise<TextExtractionResult | null> {
   const obj = await callStructuredResponse(
-    `${TEXT_AUTO_SAVE_PROMPT}\n\nUser message:\n${text}`,
+    `${TEXT_AUTO_SAVE_PROMPT}\n\nRecent conversation:\n${buildRecentConversationForExtraction(messages)}\n\nLatest user message:\n${text}`,
     "text_autosave_transaction",
     TEXT_EXTRACTION_SCHEMA
   );
@@ -1288,11 +1377,10 @@ async function saveTransactionToGateway(payload: TransactionPayload): Promise<Sa
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const messages: ChatMessage[] = body.messages ?? [];
-  const ocrText: string | undefined = body.ocrText;
-  const parsedImageTransactionRaw: unknown = body.parsedImageTransaction;
-  const parsedImageTransaction =
-    parsedImageTransactionRaw && typeof parsedImageTransactionRaw === "object"
-      ? toParsedTransaction(parsedImageTransactionRaw as Record<string, unknown>)
+  const imageAnalysisRaw: unknown = body.imageAnalysis;
+  const imageAnalysis =
+    imageAnalysisRaw && typeof imageAnalysisRaw === "object"
+      ? (imageAnalysisRaw as ImageAnalysisResult)
       : null;
   const personaRaw = String(body.persona ?? "friendly");
   const persona: AssistantPersona =
@@ -1303,7 +1391,7 @@ export async function POST(request: NextRequest) {
 
   try {
     // ── Mock save mode: type /mock-save in chat to verify save pipeline ──────
-    if (!ocrText && !parsedImageTransaction && isMockSaveCommand(lastUserMessage)) {
+    if (!imageAnalysis && isMockSaveCommand(lastUserMessage)) {
       const mockPayload: TransactionPayload = {
         item: "Mock transaction",
         amount: 123.45,
@@ -1343,7 +1431,7 @@ export async function POST(request: NextRequest) {
     }
 
     // ── Summary mode: read from gateway and summarize existing records ───────
-    if (!ocrText && !parsedImageTransaction) {
+    if (!imageAnalysis) {
       let summaryIntent = parseSummaryIntent(lastUserMessage);
       if (!summaryIntent.shouldSummarize && looksLikePotentialDbFinanceQuestion(lastUserMessage)) {
         const aiSummaryIntent = await inferSummaryIntentWithAI(lastUserMessage);
@@ -1375,16 +1463,18 @@ export async function POST(request: NextRequest) {
     }
 
     // ── Image mode: parse OCR → save transaction ──────────────────────────────
-    if (parsedImageTransaction || ocrText) {
-      const parsed = parsedImageTransaction ?? (ocrText ? await parseTransactionFromOcrText(ocrText) : null);
-
-      if (!parsed) {
+    if (imageAnalysis) {
+      if (!imageAnalysis.canAutoSave || !imageAnalysis.transaction) {
+        const reply = buildImageAnalysisReply(imageAnalysis);
         return Response.json({
-          reply: "อ่านสลิปได้ แต่ไม่สามารถแยกข้อมูลได้ กรุณาลองใหม่",
-          emotion: "concerned",
+          reply: reply.text,
+          emotion: reply.emotion,
           saved: false,
+          analyzedImage: true,
         });
       }
+
+      const parsed = imageAnalysis.transaction;
 
       const amount = normalizeAmount(parsed.amount);
 
@@ -1435,7 +1525,7 @@ export async function POST(request: NextRequest) {
     // ── Text auto-save mode ────────────────────────────────────────────────────
     if (lastUserMessage) {
       const extracted = shouldAttemptTextAutoSave(lastUserMessage)
-        ? await extractTransactionFromText(lastUserMessage)
+        ? await extractTransactionFromText(lastUserMessage, messages)
         : null;
 
       if (extracted?.shouldSave && (extracted.amount ?? 0) > 0) {
