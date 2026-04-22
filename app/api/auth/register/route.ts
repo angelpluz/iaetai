@@ -9,6 +9,20 @@ type RegisterBody = {
 };
 
 function normalizeKey(value: string) {
+  const compact = value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+  if (!compact) return "";
+
+  if (compact.startsWith("ALPHA")) {
+    const suffix = compact.slice(5);
+    if (suffix.length === 10) {
+      return `ALPHA-${suffix.slice(0, 5)}-${suffix.slice(5, 10)}`;
+    }
+    if (suffix.length === 8) {
+      return `ALPHA-${suffix}`;
+    }
+  }
+
   return value.trim().toUpperCase();
 }
 

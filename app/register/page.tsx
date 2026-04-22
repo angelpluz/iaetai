@@ -180,13 +180,13 @@ export default function RegisterPage() {
               <label className="block space-y-2.5">
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-sm font-medium text-slate-700">Alpha whitelist key</span>
-                  <span className="text-xs font-medium text-slate-400">เช่น ALPHA-2AE4CEE1</span>
+                  <span className="text-xs font-medium text-slate-400">เช่น ALPHA-CNCLW-IMHFQ</span>
                 </div>
                 <input
                   type="text"
                   value={whitelistRef}
                   onChange={(event) => setWhitelistRef(event.target.value)}
-                  placeholder="ALPHA-XXXXXXXX"
+                  placeholder="ALPHA-XXXXX-XXXXX"
                   required
                   autoComplete="off"
                   className="auth-input font-medium uppercase tracking-[0.14em]"
